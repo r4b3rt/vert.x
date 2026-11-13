@@ -1,0 +1,879 @@
+/*
+ * Copyright (c) 2011-2019 Contributors to the Eclipse Foundation
+ *
+ * This program and the accompanying materials are made available under the
+ * terms of the Eclipse Public License 2.0 which is available at
+ * http://www.eclipse.org/legal/epl-2.0, or the Apache License, Version 2.0
+ * which is available at https://www.apache.org/licenses/LICENSE-2.0.
+ *
+ * SPDX-License-Identifier: EPL-2.0 OR Apache-2.0
+ */
+package io.vertx.tests.net;
+
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.ByteBufHolder;
+import io.netty.buffer.DefaultByteBufHolder;
+import io.netty.buffer.Unpooled;
+import io.netty.channel.*;
+import io.netty.channel.embedded.EmbeddedChannel;
+import io.vertx.core.*;
+import io.vertx.core.buffer.Buffer;
+import io.vertx.core.buffer.impl.VertxUnsafeHeapByteBuf;
+import io.vertx.core.internal.ContextInternal;
+import io.vertx.core.internal.VertxInternal;
+import io.vertx.core.internal.buffer.BufferInternal;
+import io.vertx.core.internal.net.NetSocketInternal;
+import io.vertx.core.internal.concurrent.WriteOp;
+import io.vertx.core.net.NetClient;
+import io.vertx.core.net.NetServer;
+import io.vertx.core.net.NetSocket;
+import io.vertx.core.net.impl.*;
+import io.vertx.test.core.TestUtils;
+import io.vertx.test.core.VertxTestBase;
+import org.junit.Assert;
+import org.junit.Test;
+
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BiFunction;
+
+public class VertxConnectionTest extends VertxTestBase {
+
+  private NetClient client;
+  private NetServer server;
+  private volatile Handler<NetSocketInternal> connectHandler;
+
+  @Override
+  public void before() throws Exception {
+    super.before();
+    client = vertx.createNetClient();
+    server = vertx.createNetServer().connectHandler(so -> {
+      Handler<NetSocketInternal> handler = connectHandler;
+      if (handler != null) {
+        handler.handle((NetSocketInternal) so);
+      } else {
+        so.close();
+      }
+    });
+    awaitFuture(server.listen(1234, "localhost"));
+  }
+
+  @Override
+  protected void tearDown() throws Exception {
+    super.tearDown();
+    client = null;
+    server = null;
+  }
+
+  @Test
+  public void testQueueMessagesMissMessage() throws Exception {
+    disableThreadChecks();
+    CountDownLatch latch1 = new CountDownLatch(1);
+    CountDownLatch latch2 = new CountDownLatch(1);
+    connectHandler = conn -> {
+      ChannelHandlerContext chctx = conn.channelHandlerContext();
+      ChannelPipeline pipeline = chctx.pipeline();
+      List<String> received = new ArrayList<>();
+      pipeline.addBefore("handler", "myhandler", new ChannelDuplexHandler() {
+        @Override
+        public void write(ChannelHandlerContext chctx, Object msg, ChannelPromise promise) throws Exception {
+          if (msg instanceof String) {
+            received.add((String)msg);
+          } else {
+            super.write(chctx, msg, promise);
+          }
+        }
+        int flushCount;
+        @Override
+        public void flush(ChannelHandlerContext chctx) throws Exception {
+          super.flush(chctx);
+          switch (++flushCount) {
+            case 1:
+              assertEquals(List.of("msg-1"), received);
+              latch1.countDown();
+              awaitLatch(latch2);
+              break;
+            case 2:
+              assertEquals(List.of("msg-1", "msg-2"), received);
+              testComplete();
+              break;
+            default:
+              break;
+          }
+        }
+      });
+      executeAsyncTask(() -> {
+        conn.writeMessage("msg-1");
+        try {
+          awaitLatch(latch1);
+        } catch (InterruptedException e) {
+          fail(e);
+        }
+        conn.writeMessage("msg-2");
+        latch2.countDown();
+      });
+    };
+    awaitFuture(client.connect(1234, "localhost"));
+    await();
+  }
+
+  @Test
+  public void testQueueMessageFromInnerWrite() throws Exception {
+    connectHandler = conn -> {
+      ChannelHandlerContext ctx = conn.channelHandlerContext();
+      ChannelPipeline pipeline = ctx.pipeline();
+      List<String> order = new ArrayList<>();
+      pipeline.addBefore("handler", "myhandler", new ChannelDuplexHandler() {
+        @Override
+        public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) throws Exception {
+          if (msg instanceof String) {
+            String s = (String) msg;
+            order.add(s);
+            if ("msg1".equals(s)) {
+              // Write a message why there are two messages queued on the connection
+              conn.writeMessage("msg3");
+            }
+            if (order.size() == 3) {
+              vertx.runOnContext(v -> {
+                assertEquals(Arrays.asList("msg1", "msg2", "msg3"), order);
+                testComplete();
+              });
+            }
+          } else {
+            super.write(ctx, msg, promise);
+          }
+        }
+      });
+      executeAsyncTaskAndAwait(() -> {
+        conn.writeMessage("msg1");
+        conn.writeMessage("msg2");
+      });
+    };
+    awaitFuture(client.connect(1234, "localhost"));
+    await();
+  }
+
+  @Test
+  public void testQueueFlushFromEventLoop() throws Exception {
+    connectHandler = conn -> {
+      ChannelHandlerContext ctx = conn.channelHandlerContext();
+      ChannelPipeline pipeline = ctx.pipeline();
+      List<String> order = new ArrayList<>();
+      Runnable checkOrder = () -> {
+        vertx.runOnContext(v -> {
+          assertEquals(Arrays.asList("msg1", "msg2", "flush"), order);
+          testComplete();
+        });
+      };
+      pipeline.addBefore("handler", "myhandler", new ChannelDuplexHandler() {
+        int flushes;
+        @Override
+        public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) throws Exception {
+          if (msg instanceof String) {
+            String s = (String) msg;
+            order.add(s);
+            if ("msg1".equals(s)) {
+              // Flush a message why there are two messages queued on the connection
+              ((VertxConnection)conn).flush();
+            }
+          } else {
+            super.write(ctx, msg, promise);
+          }
+        }
+        @Override
+        public void flush(ChannelHandlerContext ctx) throws Exception {
+          if (flushes++ < 1) {
+            order.add("flush");
+            if (flushes == 1) {
+              checkOrder.run();
+            }
+          }
+          super.flush(ctx);
+        }
+      });
+      CountDownLatch latch = new CountDownLatch(1);
+      executeAsyncTaskAndAwait(() -> {
+        conn.writeMessage("msg1");
+        conn.writeMessage("msg2");
+        latch.countDown();
+      });
+      try {
+        latch.await(20, TimeUnit.SECONDS);
+      } catch (InterruptedException e) {
+        throw new RuntimeException(e);
+      }
+    };
+    awaitFuture(client.connect(1234, "localhost"));
+    await();
+  }
+
+  @Test
+  public void testOverflowDrain() throws Exception {
+    BufferInternal chunk = BufferInternal.buffer(TestUtils.randomAlphaString(1024 * 16));
+    CompletableFuture<Void> drain = new CompletableFuture<>();
+    connectHandler = so -> {
+      ContextInternal ctx = (ContextInternal) vertx.getOrCreateContext();
+      VertxConnection conn = (VertxConnection) so;
+      int num = 0;
+      while (conn.writeToChannel(chunk.getByteBuf())) {
+        num++;
+      }
+      Future.<Void>future(future -> conn.writeToChannel(Unpooled.EMPTY_BUFFER, future))
+        .onComplete(onSuccess(v1 -> ctx.emit(v2 -> testComplete())));
+      drain.complete(null);
+    };
+    client.connect(1234, "localhost")
+      .onComplete(onSuccess(so -> {
+        so.pause();
+        drain.whenComplete((v, e) -> {
+          so.resume();
+        });
+      }));
+    await();
+  }
+
+  private void fill(NetSocketInternal so, BufferInternal buffer, Handler<Void> cont) {
+    Runnable saturate = () -> {
+      while (true) {
+        if (!((VertxConnection)so).writeToChannel(buffer.getByteBuf())) {
+          break;
+        }
+      }
+    };
+    long id = vertx.setTimer(1000, id_ -> {
+      saturate.run();
+      cont.handle(null);
+    });
+    saturate.run();
+    so.drainHandler(v -> {
+      if (vertx.cancelTimer(id)) {
+        fill(so, buffer, cont);
+      } else {
+        fail();
+      }
+    });
+  }
+
+  @Test
+  public void testFailedQueueMessages() throws Exception {
+    BufferInternal buffer = BufferInternal.buffer(TestUtils.randomAlphaString(16 * 1024));
+    CompletableFuture<Void> latch = new CompletableFuture<>();
+    connectHandler = conn -> {
+      fill(conn, buffer, v1 -> {
+        Future<Void> fut = conn.write(buffer);
+        fut.onComplete(onFailure(v2 -> {
+          testComplete();
+        }));
+        latch.complete(null);
+      });
+    };
+    NetSocket so = awaitFuture(client.connect(1234, "localhost"));
+    so.pause();
+    latch.whenComplete((v, err) -> {
+      so.close();
+    });
+    await();
+  }
+
+  @Test
+  public void testDrainReentrancy() throws Exception {
+    connectHandler = so -> {
+      ChannelHandlerContext chctx = so.channelHandlerContext();
+      chctx.pipeline().addBefore("handler", "myhandler", new ChannelDuplexHandler() {
+        int reentrant;
+        @Override
+        public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) {
+          assertEquals(0, reentrant++);
+          try {
+            switch (msg.toString()) {
+              case "msg1":
+                // Fill outbound buffer
+                assertTrue(ctx.channel().isWritable());
+                ChannelFuture f = ctx.write(BufferInternal.buffer(TestUtils.randomAlphaString((int) ctx.channel().bytesBeforeUnwritable())).getByteBuf());
+                assertFalse(ctx.channel().isWritable());
+                ctx.flush();
+                break;
+              case "msg2":
+                testComplete();
+                break;
+            }
+          } finally {
+            reentrant--;
+          }
+        }
+      });
+
+      VertxConnection conn = (VertxConnection) so;
+      CountDownLatch latch = new CountDownLatch(1);
+      executeAsyncTask(() -> {
+        conn.writeToChannel("msg1");
+        conn.writeToChannel("msg2");
+        latch.countDown();
+      });
+      try {
+        awaitLatch(latch);
+      } catch (InterruptedException e) {
+        fail(e);
+      }
+    };
+    NetSocket so = awaitFuture(client.connect(1234, "localhost"));
+    await();
+  }
+
+  @Test
+  public void testConsolidateFlushInDrain() throws Exception {
+    connectHandler = conn -> {
+      ChannelHandlerContext ctx = conn.channelHandlerContext();
+      ChannelPipeline pipeline = ctx.pipeline();
+      pipeline.addBefore("handler", "myhandler", new ChannelDuplexHandler() {
+        int flushes;
+        int writes;
+        @Override
+        public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) {
+          writes++;
+        }
+        @Override
+        public void flush(ChannelHandlerContext ctx) throws Exception {
+          flushes++;
+          if (writes == 2) {
+            assertEquals(1, flushes);
+            testComplete();
+          }
+        }
+      });
+      CountDownLatch latch = new CountDownLatch(1);
+      executeAsyncTaskAndAwait(() -> {
+        conn.writeMessage("msg1");
+        conn.writeMessage("msg2");
+        latch.countDown();
+      });
+      try {
+        latch.await(20, TimeUnit.SECONDS);
+      } catch (InterruptedException e) {
+        throw new RuntimeException(e);
+      }
+    };
+    awaitFuture(client.connect(1234, "localhost"));
+    await();
+  }
+
+  @Test
+  public void testReleaseMessageInPendingQueueOnClose() {
+    connectHandler = conn -> {
+      ChannelPipeline pipeline = conn
+        .channelHandlerContext()
+        .pipeline();
+      List<ByteBuf> received = new ArrayList<>();
+      pipeline.addBefore("handler", "test", new ChannelDuplexHandler() {
+        @Override
+        public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
+          if (msg instanceof ByteBuf) {
+            ByteBuf buffer = (ByteBuf) msg;
+            received.add(buffer);
+            ByteBuf another = buffer.copy();
+            received.add(another);
+            super.channelRead(ctx, new DefaultByteBufHolder(buffer));
+            super.channelRead(ctx, another);
+          } else {
+            super.channelRead(ctx, msg);
+          }
+        }
+      });
+      conn.messageHandler(msg -> {
+        fail();
+      });
+      conn.readCompletionHandler(v -> {
+        conn.close();
+      });
+      conn.closeHandler(v1 -> {
+        conn.messageHandler(msg -> {
+          if (msg instanceof ByteBufHolder) {
+            ByteBufHolder holder = (ByteBufHolder)msg;
+            Assert.assertTrue(holder.content() instanceof VertxUnsafeHeapByteBuf);
+          } else if (msg instanceof ByteBuf) {
+            ByteBuf buff = (ByteBuf)msg;
+            Assert.assertTrue(buff instanceof VertxUnsafeHeapByteBuf);
+          } else {
+            Assert.fail();
+          }
+        });
+        conn.endHandler(v2 -> {
+          for (ByteBuf buff : received) {
+            Assert.assertEquals(0, buff.refCnt());
+          }
+          testComplete();
+        });
+        conn.resume();
+      });
+      conn.pause();
+    };
+    NetSocket so = client.connect(1234, "localhost").await();
+    so.write("ping").await();
+    await();
+  }
+
+  @Test
+  public void testReentrantRead() throws Exception {
+    connectHandler = conn -> {
+      ChannelHandlerContext ctx = conn.channelHandlerContext();
+      ChannelPipeline pipeline = ctx.pipeline();
+      AtomicInteger reentrant = new AtomicInteger();
+      conn.messageHandler(msg -> {
+        assertEquals(0, reentrant.getAndIncrement());
+        switch (((ByteBuf)msg).toString(StandardCharsets.UTF_8)) {
+          case "inbound-1":
+            pipeline.fireChannelRead(Unpooled.copiedBuffer("inbound-2", StandardCharsets.UTF_8));
+            break;
+          case "inbound-2":
+            conn.end(Buffer.buffer("outbound-1"));
+            break;
+        }
+        reentrant.decrementAndGet();
+      });
+    };
+    NetSocket so = awaitFuture(client.connect(1234, "localhost"));
+    Buffer received = Buffer.buffer();
+    so.handler(received::appendBuffer);
+    so.closeHandler(v -> {
+      assertEquals("outbound-1", received.toString());
+      testComplete();
+    });
+    so.write("inbound-1").await();
+    await();
+  }
+
+  @Test
+  public void testResumeWhenRead() throws Exception {
+    connectHandler = conn -> {
+      ChannelHandlerContext ctx = conn.channelHandlerContext();
+      ChannelPipeline pipeline = ctx.pipeline();
+      conn.messageHandler(msg -> {
+        switch (((ByteBuf)msg).toString(StandardCharsets.UTF_8)) {
+          case "inbound-1":
+            conn.pause();
+            pipeline.fireChannelRead(Unpooled.copiedBuffer("inbound-2", StandardCharsets.UTF_8));
+            conn.resume();
+            break;
+          case "inbound-2":
+            conn.end(Buffer.buffer("outbound-1"));
+            break;
+        }
+      });
+    };
+    NetSocket so = awaitFuture(client.connect(1234, "localhost"));
+    Buffer received = Buffer.buffer();
+    so.handler(received::appendBuffer);
+    so.closeHandler(v -> {
+      assertEquals("outbound-1", received.toString());
+      testComplete();
+    });
+    so.write("inbound-1").await();
+    await();
+  }
+
+  @Test
+  public void testWriteQueueDrain() throws Exception {
+    CountDownLatch latch = new CountDownLatch(1);
+    BufferInternal buffer = BufferInternal.buffer(TestUtils.randomAlphaString(1024));
+    connectHandler = conn -> {
+      conn.handler(ping -> {
+        fill(conn, buffer, v1 -> {
+          latch.countDown();
+          conn.drainHandler(v2 -> {
+            testComplete();
+          });
+        });
+      });
+    };
+    NetSocket so = awaitFuture(client.connect(1234, "localhost"));
+    so.pause();
+    so.write("ping");
+    awaitLatch(latch);
+    so.resume();
+    await();
+  }
+
+  @Test
+  public void testChannelPromisePiggiesBackOnEventLoop() throws Exception {
+    waitFor(2);
+    disableThreadChecks();
+    connectHandler = conn -> {
+      Promise<Void> promise = Promise.promise();
+      ChannelPromise channelPromise = ((VertxConnection) conn).unsafeWrite(Unpooled.copiedBuffer("outbound-1", StandardCharsets.UTF_8), true, promise);
+      Future<Void> future = promise.future();
+      future.onComplete(onSuccess(v -> {
+        new Thread(() -> {
+          Thread curr = Thread.currentThread();
+          future.onComplete(ar -> {
+            assertSame(curr, Thread.currentThread());
+            complete();
+          });
+          channelPromise.addListener((ChannelFutureListener) f -> {
+            assertTrue(channelPromise.channel().eventLoop().inEventLoop());
+            complete();
+          });
+        }).start();
+      }));
+    };
+    awaitFuture(client.connect(1234, "localhost"));
+    await();
+  }
+
+  private CountDownLatch executeAsyncTask(Runnable runnable) {
+    assertTrue(Context.isOnEventLoopThread());
+    CountDownLatch latch = new CountDownLatch(1);
+    new Thread(() -> {
+      runnable.run();
+      latch.countDown();
+    }).start();
+    return latch;
+  }
+
+  private void executeAsyncTaskAndAwait(Runnable runnable) {
+    try {
+      executeAsyncTask(runnable).await(20, TimeUnit.SECONDS);
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+    }
+  }
+
+  @Test
+  public void testClose() {
+    AtomicBoolean shutdown = new AtomicBoolean();
+    AtomicBoolean closed = new AtomicBoolean();
+    EmbeddedChannel channel = channel((ctx, chctx) -> new VertxConnection(ctx, chctx) {
+      @Override
+      protected void handleShutdown(Duration timeout, ChannelPromise promise) {
+        shutdown.set(true);
+        super.handleShutdown(timeout, promise);
+      }
+      @Override
+      protected void writeClose(ChannelPromise promise) {
+        closed.set(true);
+        promise.setSuccess();
+      }
+    });
+    channel.pipeline().fireUserEventTriggered(new ShutdownEvent(0, TimeUnit.SECONDS));
+    assertTrue(shutdown.get());
+    assertTrue(closed.get());
+  }
+
+  @Test
+  public void testShutdownZeroDoesClose() {
+    AtomicBoolean shutdown = new AtomicBoolean();
+    AtomicBoolean closed = new AtomicBoolean();
+    EmbeddedChannel channel = channel((ctx, chctx) -> new VertxConnection(ctx, chctx) {
+      @Override
+      protected void handleShutdown(Duration timeout, ChannelPromise promise) {
+        shutdown.set(true);
+        super.handleShutdown(timeout, promise);
+      }
+      @Override
+      protected void writeClose(ChannelPromise promise) {
+        closed.set(true);
+      }
+    });
+    channel.pipeline().fireUserEventTriggered(new ShutdownEvent(0, TimeUnit.MILLISECONDS));
+    assertTrue(shutdown.get());
+    assertTrue(closed.get());
+  }
+
+  @Test
+  public void testShutdownReentrantClose() {
+    AtomicInteger shutdown = new AtomicInteger();
+    AtomicInteger closed = new AtomicInteger();
+    EmbeddedChannel channel = channel((ctx, chctx) -> new VertxConnection(ctx, chctx) {
+      @Override
+      protected void handleShutdown(Duration timeout, ChannelPromise promise) {
+        shutdown.incrementAndGet();
+        close();
+        assertEquals(1, closed.get());
+      }
+      @Override
+      protected void writeClose(ChannelPromise promise) {
+        closed.incrementAndGet();
+      }
+    });
+    channel.pipeline().fireUserEventTriggered(new ShutdownEvent(10L, TimeUnit.SECONDS));
+    assertEquals(1, shutdown.get());
+    assertEquals(1, closed.get());
+  }
+
+  @Test
+  public void testShutdownTimeout() {
+    AtomicInteger shutdown = new AtomicInteger();
+    AtomicInteger closed = new AtomicInteger();
+    EmbeddedChannel channel = channel((ctx, chctx) -> new VertxConnection(ctx, chctx) {
+      @Override
+      protected void handleShutdown(Duration timeout, ChannelPromise promise) {
+        shutdown.incrementAndGet();
+      }
+      @Override
+      protected void writeClose(ChannelPromise promise) {
+        closed.getAndIncrement();
+      }
+    });
+    channel.pipeline().fireUserEventTriggered(new ShutdownEvent(100, TimeUnit.MILLISECONDS));
+    assertEquals(1L, shutdown.get());
+    assertEquals(0L, closed.get());
+    channel.advanceTimeBy(100, TimeUnit.MILLISECONDS);
+    assertEquals(-1, channel.runScheduledPendingTasks());
+    assertEquals(1L, shutdown.get());
+    // The broadcaster of the event controls the channel close
+    assertEquals(0L, closed.get());
+  }
+
+  @Test
+  public void testCloseWhenNotWritable() {
+    AtomicBoolean channelClosed = new AtomicBoolean();
+    AtomicBoolean written = new AtomicBoolean();
+    AtomicBoolean cancelled = new AtomicBoolean();
+    AtomicBoolean opClosed = new AtomicBoolean();
+    EmbeddedChannel channel = channel((ctx, chctx) -> new VertxConnection(ctx, chctx) {
+      @Override
+      protected void handleEvent(Object event) {
+        if ("test".equals(event)) {
+          while (channel.isWritable()) {
+            chctx.write(Unpooled.copiedBuffer(TestUtils.randomAlphaString(1024), StandardCharsets.UTF_8));
+          }
+          writeToChannel(new WriteOp() {
+            @Override
+            public void write() {
+              written.set(true);
+            }
+            @Override
+            public void cancel(Throwable cause) {
+              cancelled.set(true);
+            }
+          });
+          close().onComplete(ar -> opClosed.set(true));
+        } else {
+          super.handleEvent(event);
+        }
+      }
+      @Override
+      protected void handleClosed() {
+        channelClosed.set(true);
+        super.handleClosed();
+      }
+    });
+    AtomicReference<ChannelHandlerContext> flushOp = new AtomicReference<>();
+    channel.pipeline().addFirst(new ChannelOutboundHandlerAdapter() {
+      @Override
+      public void flush(ChannelHandlerContext ctx) throws Exception {
+        flushOp.set(ctx);
+      }
+    });
+    channel.pipeline().fireUserEventTriggered("test");
+    assertFalse(channelClosed.get());
+    assertFalse(opClosed.get());
+    assertTrue(written.get());
+    assertFalse(cancelled.get());
+    assertTrue(channel.isActive());
+    flushOp.get().flush();
+    assertTrue(channelClosed.get());
+    assertTrue(opClosed.get());
+    assertTrue(written.get());
+    assertFalse(cancelled.get());
+    assertFalse(channel.isActive());
+  }
+
+  @Test
+  public void testCloseForciblyWhenNotWritable() {
+    AtomicBoolean channelClosed = new AtomicBoolean();
+    AtomicBoolean written = new AtomicBoolean();
+    AtomicBoolean cancelled = new AtomicBoolean();
+    AtomicBoolean last = new AtomicBoolean();
+    EmbeddedChannel channel = channel((ctx, chctx) -> new VertxConnection(ctx, chctx) {
+      @Override
+      protected void handleEvent(Object event) {
+        if ("test".equals(event)) {
+          while (channel.isWritable()) {
+            chctx.write(Unpooled.copiedBuffer(TestUtils.randomAlphaString(1024), StandardCharsets.UTF_8));
+          }
+          VertxConnection connection = this;
+          writeToChannel(new WriteOp() {
+            @Override
+            public void write() {
+              written.set(true);
+              ChannelPromise cp = connection.channel().newPromise();
+              cp.addListener((ChannelFutureListener) future -> last.set(future.isSuccess()));
+              connection.unsafeWrite("LAST", false, cp);
+            }
+            @Override
+            public void cancel(Throwable cause) {
+              cancelled.set(true);
+            }
+          });
+        } else {
+          super.handleEvent(event);
+        }
+      }
+      @Override
+      protected void handleClosed() {
+        channelClosed.set(true);
+        super.handleClosed();
+      }
+    });
+    channel.pipeline().fireUserEventTriggered("test");
+    channel.pipeline().fireUserEventTriggered(new ShutdownEvent(Duration.ZERO));
+    assertTrue(channelClosed.get());
+    assertTrue(written.get());
+    assertFalse(cancelled.get());
+    assertFalse(channel.isActive());
+    assertTrue(last.get());
+  }
+
+  @Test
+  public void testCloseForciblyWhenDraining() {
+    AtomicBoolean written = new AtomicBoolean();
+    AtomicBoolean cancelled = new AtomicBoolean();
+    AtomicBoolean channelClosed = new AtomicBoolean();
+    AtomicBoolean last = new AtomicBoolean();
+    EmbeddedChannel channel = channel((ctx, chctx) -> new VertxConnection(ctx, chctx) {
+      @Override
+      protected void handleEvent(Object event) {
+        VertxConnection connection = this;
+        if ("test".equals(event)) {
+          writeToChannel(new WriteOp() {
+            @Override
+            public void write() {
+              written.set(true);
+              ChannelPromise cp = connection.channel().newPromise();
+              cp.addListener((ChannelFutureListener) future -> last.set(future.isSuccess()));
+              connection.unsafeWrite("LAST", false, cp);
+              connection.close();
+            }
+            @Override
+            public void cancel(Throwable cause) {
+              cancelled.set(true);
+            }
+          });
+        } else {
+          super.handleEvent(event);
+        }
+      }
+      @Override
+      protected void handleClosed() {
+        channelClosed.set(true);
+        super.handleClosed();
+      }
+    });
+    channel.pipeline().fireUserEventTriggered("test");
+    assertTrue(channelClosed.get());
+    assertTrue(written.get());
+    assertFalse(cancelled.get());
+    assertFalse(channel.isActive());
+    assertTrue(last.get());
+  }
+
+  private <C extends VertxConnection> EmbeddedChannel channel(BiFunction<ContextInternal, ChannelHandlerContext, C> connectionFactory) {
+    return new EmbeddedChannel(VertxHandler.create(chctx -> {
+      ContextInternal ctx = ((VertxInternal)vertx)
+        .contextBuilder()
+        .withEventLoop(chctx.channel().eventLoop())
+        .build();
+      return connectionFactory.apply(ctx, chctx);
+    }));
+  }
+
+  private class TestConnection extends VertxConnection {
+    Handler<Message> handler;
+    Handler<Void> readCompleteHandler;
+    public TestConnection(ChannelHandlerContext chctx) {
+      super(((VertxInternal) VertxConnectionTest.this.vertx)
+        .contextBuilder()
+        .withEventLoop((EventLoop) chctx.executor())
+        .build(), chctx);
+    }
+    @Override
+    protected void handleMessage(Object msg) {
+      Handler<Message> h = handler;
+      if (h != null) {
+        h.handle((Message) msg);
+      }
+    }
+
+    @Override
+    protected void handleReadComplete() {
+      Handler<Void> h = readCompleteHandler;
+      if (h != null) {
+        h.handle(null);
+      }
+    }
+
+    public void pause() {
+      doPause();
+    }
+
+    public void resume() {
+      chctx.executor().execute(this::doResume);
+    }
+  }
+
+  static class Message {
+    final String id;
+    Message(String id) {
+      this.id = id;
+    }
+  }
+
+  static class MessageFactory {
+    int seq = 0;
+    Message next() {
+      return new Message("msg-" + seq++);
+    }
+    Message[] next(int num) {
+      Message[] messages = new Message[num];
+      for (int i = 0;i < num;i++) {
+        messages[i] = next();
+      }
+      return messages;
+    }
+  }
+
+  @Test
+  public void testDisableAutoReadWhenPaused() {
+    List<Object> receivedMessages = new ArrayList<>();
+    MessageFactory factory = new MessageFactory();
+    EmbeddedChannel ch = new EmbeddedChannel();
+    ChannelPipeline pipeline = ch.pipeline();
+    pipeline.addLast(VertxHandler.create(chctx -> new TestConnection(chctx)));
+    TestConnection connection = (TestConnection) pipeline.get(VertxHandler.class).getConnection();
+    connection.handler = receivedMessages::add;
+    connection.pause();
+    assertFalse(ch.config().isAutoRead());
+  }
+
+  @Test
+  public void testFlushPendingWriteOnExceptionClose() {
+    EmbeddedChannel ch = new EmbeddedChannel();
+    ChannelPipeline pipeline = ch.pipeline();
+    pipeline.addLast(VertxHandler.create(chctx -> new TestConnection(chctx)));
+    TestConnection connection = (TestConnection) pipeline.get(VertxHandler.class).getConnection();
+    connection.exceptionHandler(err -> {});
+    // Queue a write without flushing it: this is the state produced when a response is written
+    // while a read is in progress (e.g. an inbound codec failing mid-decode, which is how a
+    // request-body decompression failure surfaces). The message sits in the channel outbound
+    // buffer as an unflushed entry.
+    Object response = new Object();
+    connection.unsafeWrite(response, false);
+    assertNull(ch.readOutbound());
+    // The failure surfaces as a caught exception that asks the connection to close. The close
+    // must flush the pending write before closing the channel, otherwise Netty's
+    // ChannelOutboundBuffer discards the unflushed entry and the peer never sees the response.
+    pipeline.fireExceptionCaught(new RuntimeException());
+    ch.runPendingTasks();
+    assertSame(response, ch.readOutbound());
+    assertFalse(ch.isOpen());
+  }
+}

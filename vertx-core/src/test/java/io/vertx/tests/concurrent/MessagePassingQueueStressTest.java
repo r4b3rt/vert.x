@@ -1,0 +1,240 @@
+package io.vertx.tests.concurrent;
+
+import io.vertx.core.VertxOptions;
+import io.vertx.core.streams.impl.MessagePassingQueue;
+import io.vertx.test.core.Repeat;
+import io.vertx.test.core.VertxTestBase;
+import org.junit.Test;
+
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicIntegerArray;
+import java.util.concurrent.atomic.LongAdder;
+
+import static io.vertx.core.streams.impl.MessagePassingQueue.numberOfUnwritableSignals;
+
+public class MessagePassingQueueStressTest extends VertxTestBase {
+
+  @Override
+  public void setUp() throws Exception {
+    super.setUp();
+    disableThreadChecks();
+  }
+
+  @Test
+  public void testSimple() throws Exception {
+    LongAdder counter = new LongAdder();
+    MessagePassingQueue.MpSc<Object> queue = new MessagePassingQueue.MpSc<>(foo -> {
+      counter.increment();
+      return true;
+    });
+    int numThreads = 10;
+    int numEmissions = 10;
+    int numReps = 1000;
+    Object elt = new Object();
+    Thread[] threads = new Thread[numThreads];
+    CyclicBarrier barrier = new CyclicBarrier(1 + numThreads);
+    for (int i = 0;i < numThreads;i++) {
+      Thread thread = new Thread(() -> {
+        try {
+          barrier.await();
+        } catch (Exception e) {
+          fail(e);
+        }
+        for (int j = 0; j < numReps; j++) {
+          for (int k = 0;k < numEmissions;k++) {
+            int flags = queue.add(elt);
+            if ((flags & MessagePassingQueue.DRAIN_REQUIRED_MASK) != 0) {
+              flags = queue.drain();
+              assertEquals(0, flags & (MessagePassingQueue.DRAIN_REQUIRED_MASK));
+            }
+          }
+          try {
+            Thread.sleep(1);
+          } catch (InterruptedException e) {
+            throw new RuntimeException(e);
+          }
+        }
+      });
+      thread.start();
+      threads[i] = thread;
+    }
+    barrier.await();
+    for (int i = 0;i < numThreads;i++) {
+      threads[i].join();
+    }
+    assertEquals(numThreads * numEmissions * numReps, counter.intValue());
+  }
+
+  @Test
+  public void testDepthStampProducerDrain() throws Exception {
+    int numThreads = 10;
+    int numEmissions = 10;
+    int numReps = 1000;
+    class Element {
+      int depth;
+      int check;
+    }
+    LongAdder consumed = new LongAdder();
+    LongAdder violations = new LongAdder();
+    MessagePassingQueue.MpSc<Element> queue = new MessagePassingQueue.MpSc<>(elt -> {
+      if (elt.depth < 1 || elt.check != ~elt.depth) {
+        violations.increment();
+      }
+      consumed.increment();
+      return true;
+    }, (element, depth, seq) -> {
+      element.depth = depth;
+      element.check = ~depth;
+    }, 1, 4);
+    Thread[] threads = new Thread[numThreads];
+    CyclicBarrier barrier = new CyclicBarrier(1 + numThreads);
+    for (int i = 0;i < numThreads;i++) {
+      Thread thread = new Thread(() -> {
+        try {
+          barrier.await();
+        } catch (Exception e) {
+          fail(e);
+          return;
+        }
+        for (int j = 0;j < numReps;j++) {
+          for (int k = 0;k < numEmissions;k++) {
+            int flags = queue.add(new Element());
+            if ((flags & MessagePassingQueue.DRAIN_REQUIRED_MASK) != 0) {
+              queue.drain();
+            }
+          }
+        }
+      });
+      thread.start();
+      threads[i] = thread;
+    }
+    barrier.await();
+    for (int i = 0;i < numThreads;i++) {
+      threads[i].join();
+    }
+    assertEquals(numThreads * numEmissions * numReps, consumed.intValue());
+    assertEquals(0, violations.intValue());
+  }
+
+  @Test
+  public void testDepthVisibility() throws Exception {
+    int numThreads = 10;
+    int numReps = 10_000;
+    class Element {
+      int depth;
+      int check;
+      int seq;
+    }
+    LongAdder consumed = new LongAdder();
+    LongAdder violations = new LongAdder();
+    AtomicIntegerArray seen = new AtomicIntegerArray(numThreads * numReps);
+    ExecutorService consumerThread = Executors.newSingleThreadExecutor();
+    try {
+      MessagePassingQueue.MpSc<Element> queue = new MessagePassingQueue.MpSc<>(elt -> {
+        if (elt.depth < 1 || elt.check != ~elt.depth) {
+          violations.increment();
+        }
+        if (elt.seq < 1 || elt.seq > seen.length() || seen.getAndIncrement(elt.seq - 1) != 0) {
+          violations.increment();
+        }
+        consumed.increment();
+        return true;
+      }, (elt, depth, seq) -> {
+        elt.depth = depth;
+        elt.check = ~depth;
+        elt.seq = seq;
+      }, 1, 4);
+      Thread[] threads = new Thread[numThreads];
+      CyclicBarrier barrier = new CyclicBarrier(1 + numThreads);
+      for (int i = 0;i < numThreads;i++) {
+        Thread thread = new Thread(() -> {
+          try {
+            barrier.await();
+          } catch (Exception e) {
+            fail(e);
+            return;
+          }
+          for (int j = 0;j < numReps;j++) {
+            int flags = queue.add(new Element());
+            if ((flags & MessagePassingQueue.DRAIN_REQUIRED_MASK) != 0) {
+              consumerThread.execute(queue::drain);
+            }
+          }
+        });
+        thread.start();
+        threads[i] = thread;
+      }
+      barrier.await();
+      for (int i = 0;i < numThreads;i++) {
+        threads[i].join();
+      }
+      assertWaitUntil(() -> consumed.intValue() == numThreads * numReps);
+      assertEquals(0, violations.intValue());
+    } finally {
+      consumerThread.shutdown();
+    }
+  }
+
+  @Repeat(times = 50)
+  @Test
+  public void testWriteQueueFull() throws Exception {
+    int numProducers = VertxOptions.DEFAULT_EVENT_LOOP_POOL_SIZE / 2;
+    int numReps = 10000;
+    int[] consumedLocal = new int[1];
+    MessagePassingQueue.MpSc<Object> queue = new MessagePassingQueue.MpSc<>(elt -> {
+      consumedLocal[0]++;
+      return true;
+    });
+    // The number of consumed elements
+    AtomicInteger numOfConsumedElements = new AtomicInteger();
+    AtomicInteger numOfUnwritableSignalsFromDrain = new AtomicInteger();
+    AtomicInteger numOfUnwritableSignalsFromSubmit = new AtomicInteger();
+    Thread[] producers = new Thread[numProducers];
+    CyclicBarrier start = new CyclicBarrier(1 + producers.length);
+    for (int i = 0;i < producers.length;i++) {
+      int val = i;
+      String name = "producer-" + val;
+      Thread producer = new Thread(() -> {
+        try {
+          start.await();
+        } catch (Exception e) {
+          fail(e);
+          return;
+        }
+        int iter = numReps;
+        while (iter-- > 0) {
+          int flags = queue.add(val);
+          if ((flags & MessagePassingQueue.UNWRITABLE_MASK) != 0) {
+            numOfUnwritableSignalsFromSubmit.incrementAndGet();
+          }
+          if ((flags & MessagePassingQueue.DRAIN_REQUIRED_MASK) != 0) {
+            int flags2;
+            // We synchronize to simulate single consumer with respect to internal queue state
+            // todo : we should sync that although in practice this is always the same thread (event-loop)
+            // it's just more convenient to do that for writing this test
+            synchronized (MessagePassingQueueStressTest.class) {
+              consumedLocal[0] = 0;
+              flags2 = queue.drain();
+              numOfConsumedElements.addAndGet(consumedLocal[0]);
+            }
+            if ((flags2 & MessagePassingQueue.WRITABLE_MASK) != 0) {
+              int unwritable = numberOfUnwritableSignals(flags2);
+              numOfUnwritableSignalsFromDrain.addAndGet(unwritable);
+            }
+          }
+        }
+      }, name);
+      producer.start();
+      producers[i] = producer;
+    }
+    start.await();
+    for (int i = 0;i < numProducers;i++) {
+      producers[i].join(10_000);
+    }
+    assertEquals((long) numProducers * numReps, numOfConsumedElements.get());
+    assertEquals(numOfUnwritableSignalsFromSubmit.get(), numOfUnwritableSignalsFromDrain.get());
+  }
+}

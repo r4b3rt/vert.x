@@ -1,0 +1,59 @@
+/*
+ * Copyright (c) 2011-2019 Contributors to the Eclipse Foundation
+ *
+ * This program and the accompanying materials are made available under the
+ * terms of the Eclipse Public License 2.0 which is available at
+ * http://www.eclipse.org/legal/epl-2.0, or the Apache License, Version 2.0
+ * which is available at https://www.apache.org/licenses/LICENSE-2.0.
+ *
+ * SPDX-License-Identifier: EPL-2.0 OR Apache-2.0
+ */
+
+package io.vertx.core.http.impl;
+
+import io.netty.buffer.Unpooled;
+import io.vertx.core.Handler;
+import io.vertx.core.MultiMap;
+import io.vertx.core.http.*;
+import io.vertx.core.internal.buffer.BufferInternal;
+import io.vertx.core.internal.streams.WriteResult;
+
+/**
+ * @author <a href="mailto:julien@julienviet.com">Julien Viet</a>
+ */
+public interface HttpClientStream extends HttpStream {
+
+  Object trace();
+
+  HttpClientConnection connection();
+
+  /**
+   * Set the head of the stream, it is written by the next content operation: alone for an empty write, with the
+   * end of the stream for a bodyless end.
+   */
+  HttpClientStream head(HttpRequestHead request);
+
+  /**
+   * Write the head alone, as {@link #head} followed by an empty write.
+   */
+  default WriteResult writeHead(HttpRequestHead request) {
+    return head(request).write(BufferInternal.buffer(Unpooled.EMPTY_BUFFER));
+  }
+
+  HttpClientStream headHandler(Handler<HttpResponseHead> handler);
+  HttpClientStream resetHandler(Handler<Long> handler);
+  HttpClientStream exceptionHandler(Handler<Throwable> handler);
+  HttpClientStream continueHandler(Handler<Void> handler);
+  HttpClientStream earlyHintsHandler(Handler<MultiMap> handler);
+  HttpClientStream pushHandler(Handler<HttpClientPush> handler);
+  HttpClientStream customFrameHandler(Handler<HttpFrame> handler);
+  HttpClientStream trailersHandler(Handler<MultiMap> handler);
+  HttpClientStream priorityChangeHandler(Handler<StreamPriority> handler);
+  HttpClientStream closeHandler(Handler<Void> handler);
+  HttpClientStream drainHandler(Handler<Void> handler);
+
+  HttpClientStream setWriteQueueMaxSize(int maxSize);
+
+  HttpClientStream updatePriority(StreamPriority streamPriority);
+
+}

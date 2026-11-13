@@ -1,0 +1,175 @@
+/*
+ * Copyright (c) 2011-2020 Contributors to the Eclipse Foundation
+ *
+ * This program and the accompanying materials are made available under the
+ * terms of the Eclipse Public License 2.0 which is available at
+ * http://www.eclipse.org/legal/epl-2.0, or the Apache License, Version 2.0
+ * which is available at https://www.apache.org/licenses/LICENSE-2.0.
+ *
+ * SPDX-License-Identifier: EPL-2.0 OR Apache-2.0
+ */
+package io.vertx.core.eventbus.impl;
+
+import io.vertx.core.*;
+import io.vertx.core.eventbus.DeliveryContext;
+import io.vertx.core.eventbus.Message;
+import io.vertx.core.eventbus.ReplyException;
+import io.vertx.core.eventbus.ReplyFailure;
+import io.vertx.core.internal.ContextInternal;
+import io.vertx.core.spi.tracing.SpanKind;
+import io.vertx.core.spi.tracing.TagExtractor;
+import io.vertx.core.spi.tracing.VertxTracer;
+import io.vertx.core.tracing.TracingPolicy;
+
+import java.util.function.Consumer;
+import java.util.function.Function;
+
+public abstract class HandlerRegistration<T> implements Closeable {
+
+  protected final ContextInternal context;
+  protected final EventBusImpl bus;
+  protected final String address;
+  protected final boolean src;
+  protected final TracingPolicy tracingPolicy;
+  private Consumer<Promise<Void>> registered;
+  private Object metric;
+
+  HandlerRegistration(ContextInternal context,
+                      EventBusImpl bus,
+                      String address,
+                      boolean src,
+                      TracingPolicy tracingPolicy) {
+    this.context = context;
+    this.bus = bus;
+    this.src = src;
+    this.address = address;
+    this.tracingPolicy = tracingPolicy;
+  }
+
+  void receive(MessageImpl msg) {
+    if (bus.metrics != null) {
+      bus.metrics.scheduleMessage(metric, msg.isLocal());
+    }
+    context.executor().execute(() -> {
+      // Need to check handler is still there - the handler might have been removed after the message were sent but
+      // before it was received
+      doReceive(msg);
+    });
+  }
+
+  public String address() {
+    return address;
+  }
+
+  protected abstract void doReceive(Message<T> msg);
+
+  protected abstract void dispatchMessage(Message<T> msg, ContextInternal context, Function<Message<T>, Future<?>> processor, Completable<Object> completion);
+
+  synchronized void register(boolean broadcast, boolean localOnly, Completable<Void> promise) {
+    if (registered != null) {
+      throw new IllegalStateException();
+    }
+    registered = bus.addRegistration(address, this, broadcast, localOnly, promise);
+    if (bus.metrics != null) {
+      metric = bus.metrics.handlerRegistered(address);
+    }
+  }
+
+  public synchronized boolean isRegistered() {
+    return registered != null;
+  }
+
+  public Future<Void> unregister() {
+    Promise<Void> promise = context.owner().promise();
+    synchronized (this) {
+      if (registered != null) {
+        registered.accept(promise);
+        registered = null;
+        if (bus.metrics != null) {
+          bus.metrics.handlerUnregistered(metric);
+        }
+      } else {
+        promise.complete();
+      }
+    }
+    return promise.future();
+  }
+
+  void dispatchMessage(Function<Message<T>, Future<?>> processor, MessageImpl<?, T> message, ContextInternal context) {
+    Handler<DeliveryContext<?>>[] interceptors = message.bus.inboundInterceptors();
+    if (interceptors.length > 0) {
+      Handler<ReplyException> dispatch = failure -> {
+        if (failure == null) {
+          dispatch(context, message, processor);
+        } else {
+          message.reply(failure);
+        }
+      };
+      DeliveryContextImpl<T> deliveryCtx = new DeliveryContextImpl<>(message, interceptors, context, message.receivedBody, dispatch);
+      deliveryCtx.next();
+    } else {
+      dispatch(context, message, processor);
+    }
+  }
+
+  private void dispatch(ContextInternal ctx, MessageImpl<?, T> message, Function<Message<T>, Future<?>> processor) {
+    Object m = metric;
+    VertxTracer tracer = ctx.tracer();
+    if (bus.metrics != null) {
+      bus.metrics.messageDelivered(m, message.isLocal());
+    }
+    if (tracer != null && !src) {
+      message.trace = tracer.receiveRequest(ctx, SpanKind.RPC, tracingPolicy, message, message.isSend() ? "send" : "publish", message.headers(), MessageTagExtractor.INSTANCE);
+      Promise<Object> completion = ctx.promise();
+      dispatchMessage(message, ctx, processor, completion);
+      if (message.replyAddress == null && message.trace != null) {
+        completion.future().onComplete(new TraceNoReplyCompletion(tracer, ctx, message.trace));
+      }
+    } else {
+      dispatchMessage(message, ctx, processor, NO_OP);
+    }
+  }
+
+  private static class TraceNoReplyCompletion implements Handler<AsyncResult<Object>> {
+    final VertxTracer tracer;
+    final ContextInternal ctx;
+    final Object trace;
+
+    TraceNoReplyCompletion(VertxTracer tracer, ContextInternal ctx, Object trace) {
+      this.tracer = tracer;
+      this.ctx = ctx;
+      this.trace = trace;
+    }
+
+    @Override
+    public void handle(AsyncResult<Object> ar) {
+      if (ar.succeeded()) {
+        tracer.sendResponse(ctx, null, trace, null, TagExtractor.empty());
+      } else {
+        tracer.sendResponse(ctx, null, trace, ar.cause(), TagExtractor.empty());
+      }
+    }
+  }
+
+  private static final Completable<Object> NO_OP = new Completable<>() {
+    @Override
+    public void complete(Object result, Throwable failure) {
+    }
+  };
+
+  void discardMessage(Message<T> msg) {
+    if (bus.metrics != null) {
+      bus.metrics.discardMessage(metric, ((MessageImpl)msg).isLocal(), msg);
+    }
+
+    String replyAddress = msg.replyAddress();
+    if (replyAddress != null) {
+      msg.reply(new ReplyException(ReplyFailure.TIMEOUT, "Discarded the request. address: " + replyAddress + ", repliedAddress: " + msg.address()));
+    }
+  }
+
+  @Override
+  public void close(Completable<Void> completion) {
+    unregister().onComplete(completion);
+  }
+}

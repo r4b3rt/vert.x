@@ -1,0 +1,6998 @@
+/*
+ * Copyright (c) 2011-2019 Contributors to the Eclipse Foundation
+ *
+ * This program and the accompanying materials are made available under the
+ * terms of the Eclipse Public License 2.0 which is available at
+ * http://www.eclipse.org/legal/epl-2.0, or the Apache License, Version 2.0
+ * which is available at https://www.apache.org/licenses/LICENSE-2.0.
+ *
+ * SPDX-License-Identifier: EPL-2.0 OR Apache-2.0
+ */
+
+package io.vertx.tests.http;
+
+import io.netty.buffer.ByteBufUtil;
+import io.netty.channel.ConnectTimeoutException;
+import io.netty.channel.EventLoop;
+import io.netty.handler.codec.compression.DecompressionException;
+import io.netty.handler.codec.http.HttpHeaderNames;
+import io.netty.handler.codec.http.HttpResponseStatus;
+import io.netty.handler.codec.http2.Http2Exception;
+import io.vertx.codegen.annotations.Nullable;
+import io.vertx.core.*;
+import io.vertx.core.Future;
+import io.vertx.core.buffer.Buffer;
+import io.vertx.core.dns.AddressResolverOptions;
+import io.vertx.core.http.*;
+import io.vertx.core.http.HttpClientConnection;
+import io.vertx.core.http.HttpResponseHead;
+import io.vertx.core.http.impl.*;
+import io.vertx.core.http.impl.headers.Http1xHeaders;
+import io.vertx.core.http.impl.tcp.TcpHttpServer;
+import io.vertx.core.internal.ContextInternal;
+import io.vertx.core.internal.VertxInternal;
+import io.vertx.core.internal.streams.WriteResult;
+import io.vertx.core.json.JsonObject;
+import io.vertx.core.net.*;
+import io.vertx.core.streams.ReadStream;
+import io.vertx.core.streams.WriteStream;
+import io.vertx.test.core.*;
+import io.vertx.test.fakedns.DnsRecord;
+import io.vertx.test.fakedns.WithDnsServer;
+import io.vertx.test.fakestream.FakeStream;
+import io.vertx.test.http.HttpClientConfigurator;
+import io.vertx.test.http.HttpConfigurator;
+import io.vertx.test.http.SimpleHttpTest2;
+import io.vertx.test.tls.Cert;
+import io.vertx.tests.http.http3.Http3Test;
+import org.assertj.core.api.AbstractThrowableAssert;
+import org.junit.Assert;
+import org.junit.Assume;
+import org.junit.Test;
+
+import javax.net.ssl.SSLSession;
+import java.io.*;
+import java.net.ServerSocket;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
+import java.text.DateFormat;
+import java.text.SimpleDateFormat;
+import java.time.Duration;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.*;
+import java.util.stream.IntStream;
+
+import static io.vertx.core.http.HttpMethod.*;
+import static io.vertx.core.net.SocketAddress.inetSocketAddress;
+import static io.vertx.test.core.AssertExpectations.that;
+import static io.vertx.test.core.TestUtils.*;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.junit.Assert.*;
+import static org.junit.Assume.assumeTrue;
+
+/**
+ * @author <a href="mailto:julien@julienviet.com">Julien Viet</a>
+ */
+public abstract class HttpTest extends SimpleHttpTest2 {
+
+  protected HttpTest(HttpConfigurator config) {
+    super(config);
+  }
+
+  @Test
+  public void testCloseMulti() throws Exception {
+    int num = 4;
+    HttpServer[] servers = new HttpServer[num];
+    for (int i = 0;i < num;i++) {
+      int val = i;
+      servers[i] = createHttpServer().requestHandler(req -> {
+        req.response().end("Server " + val);
+      });
+      startServer(testAddress, servers[i]);
+    }
+    List<HttpClientConnection> connections = Collections.synchronizedList(new ArrayList<>());
+    for (int i = 0;i < num;i++) {
+      client.connect(new HttpConnectOptions().setServer(testAddress))
+        .onComplete(TestUtils.onSuccess(connections::add));
+    }
+    waitUntil(() -> connections.size() == 4);
+    Set<String> actual = new HashSet<>();
+    Set<String> expected = new HashSet<>();
+    for (int i = 0;i < num;i++) {
+      Buffer body = connections.get(i)
+        .request(requestOptions)
+        .compose(req -> req.send()
+          .compose(HttpClientResponse::body)
+        ).await();
+      expected.add("Server " + i);
+      actual.add(body.toString());
+    }
+    assertEquals(expected, actual);
+    servers[3].close().await();
+    int successes = 0;
+    int failures = 0;
+    for (int i = 0;i < num;i++) {
+      Future<Buffer> fut = connections.get(i)
+        .request(requestOptions)
+        .compose(req -> req.send()
+          .compose(HttpClientResponse::body)
+        );
+      try {
+        fut.await();
+        successes++;
+      } catch (Exception e) {
+        failures++;
+      }
+    }
+    assertEquals(3, successes);
+    assertEquals(1, failures);
+  }
+
+  @Test
+  public void testClientRequestArguments() throws Exception {
+    server.requestHandler(req -> {
+     Assert.fail();
+    });
+    startServer(testAddress);
+    client.request(requestOptions).andThen(TestUtils.onSuccess(req -> {
+      assertNullPointerException(() -> req.putHeader((String) null, "someValue"));
+      assertNullPointerException(() -> req.putHeader((CharSequence) null, "someValue"));
+      assertNullPointerException(() -> req.putHeader("someKey", (Iterable<String>) null));
+      assertNullPointerException(() -> req.write((Buffer) null));
+      assertNullPointerException(() -> req.write((String) null));
+      assertNullPointerException(() -> req.write(null, "UTF-8"));
+      assertNullPointerException(() -> req.write("someString", (String) null));
+      assertNullPointerException(() -> req.end((Buffer) null));
+      assertNullPointerException(() -> req.end((String) null));
+      assertNullPointerException(() -> req.end(null, "UTF-8"));
+      assertNullPointerException(() -> req.end("someString", (String) null));
+      assertIllegalArgumentException(() -> req.idleTimeout(0));;
+    })).await();
+  }
+
+  @Test
+  public void testLowerCaseHeaders() throws Exception {
+    server.requestHandler(req -> {
+      assertEquals("foo", req.headers().get("Foo"));
+      assertEquals("foo", req.headers().get("foo"));
+      assertEquals("foo", req.headers().get("fOO"));
+      assertTrue(req.headers().contains("Foo"));
+      assertTrue(req.headers().contains("foo"));
+      assertTrue(req.headers().contains("fOO"));
+
+      req.response().putHeader("Quux", "quux");
+
+      assertEquals("quux", req.response().headers().get("Quux"));
+      assertEquals("quux", req.response().headers().get("quux"));
+      assertEquals("quux", req.response().headers().get("qUUX"));
+      assertTrue(req.response().headers().contains("Quux"));
+      assertTrue(req.response().headers().contains("quux"));
+      assertTrue(req.response().headers().contains("qUUX"));
+
+      req.response().end();
+    });
+
+    startServer(testAddress);
+    client
+      .request(requestOptions)
+      .compose(req -> {
+        req.putHeader("Foo", "foo");
+        assertEquals("foo", req.headers().get("Foo"));
+        assertEquals("foo", req.headers().get("foo"));
+        assertEquals("foo", req.headers().get("fOO"));
+        assertTrue(req.headers().contains("Foo"));
+        assertTrue(req.headers().contains("foo"));
+        assertTrue(req.headers().contains("fOO"));
+        return req
+          .send().compose(resp -> {
+            assertEquals("quux", resp.headers().get("Quux"));
+            assertEquals("quux", resp.headers().get("quux"));
+            assertEquals("quux", resp.headers().get("qUUX"));
+            assertTrue(resp.headers().contains("Quux"));
+            assertTrue(resp.headers().contains("quux"));
+            assertTrue(resp.headers().contains("qUUX"));
+            return resp.end();
+          });
+      }).await();
+  }
+
+  @Test
+  public void testServerActualPortWhenSet() throws Exception {
+    assumeTrue(testAddress.isInetSocket());
+    server
+        .requestHandler(request -> {
+          request.response().end("hello");
+        });
+    startServer(testAddress);
+    assertEquals(server.actualPort(), config.port());
+    HttpClient client = createHttpClient();
+    Buffer body = client
+      .request(new RequestOptions(requestOptions).setPort(server.actualPort()))
+      .compose(req -> req
+        .send()
+        .compose(resp -> {
+          assertEquals(200, resp.statusCode());
+          return resp.body();
+        }))
+      .await();
+    assertEquals("hello", body.toString("UTF-8"));
+  }
+
+  @Test
+  public void testServerActualPortWhenZero() throws Exception {
+    assumeTrue(testAddress.isInetSocket());
+    server = createHttpServer();
+    server
+        .requestHandler(request -> {
+          request.response().end("hello");
+        });
+    server.listen(0).await();
+    assertTrue(server.actualPort() != 0);
+    HttpClient client = createHttpClient();
+    Buffer body = client
+      .request(new RequestOptions(requestOptions).setPort(server.actualPort()))
+      .compose(req -> req
+        .send()
+        .compose(resp -> {
+          assertEquals(200, resp.statusCode());
+          return resp.body();
+        }))
+      .await();
+    assertEquals("hello", body.toString("UTF-8"));
+  }
+
+  @Test
+  public void testServerActualPortWhenZeroPassedInListen() throws Exception {
+    assumeTrue(testAddress.isInetSocket());
+    server = createHttpServer();
+    server
+        .requestHandler(request -> {
+          request.response().end("hello");
+        });
+    startServer();
+    assertTrue(server.actualPort() != 0);
+    client = createHttpClient();
+    Buffer body = client.request(new RequestOptions(requestOptions).setPort(server.actualPort()))
+      .compose(req -> req
+        .send()
+        .compose(resp -> {
+          assertEquals(resp.statusCode(), 200);
+          return resp.body();
+        }))
+      .await();
+    assertEquals(body.toString("UTF-8"), "hello");
+  }
+
+  @Test
+  public void testClientRequestOptionsSocketAddressOnly() throws Exception {
+    assumeTrue(testAddress.isInetSocket());
+    Integer port = requestOptions.getPort();
+    String host = requestOptions.getHost();
+    server
+      .requestHandler(request -> {
+        assertEquals(host, request.authority().host());
+        assertEquals((int)port, request.authority().port());
+        request.response().end();
+      });
+    startServer(testAddress);
+    SocketAddress server = inetSocketAddress(port, host);
+    client.request(new RequestOptions().setServer(server))
+      .compose(req -> req
+        .send()
+        .compose(resp -> {
+          assertEquals(200, resp.statusCode());
+          return resp.body();
+        }))
+      .await();
+  }
+
+  /*
+  @Test
+  public void testRequestNPE() {
+    String uri = "/some-uri?foo=bar";
+    TestUtils.assertNullPointerException(() -> client.request(null, DEFAULT_HTTP_PORT, DEFAULT_HTTP_HOST, uri));
+    TestUtils.assertNullPointerException(() -> client.request( null, 8080, "localhost", "/somepath"));
+    TestUtils.assertNullPointerException(() -> client.request(HttpMethod.GET, 8080, null, "/somepath"));
+    TestUtils.assertNullPointerException(() -> client.request(HttpMethod.GET, 8080, "localhost", null));
+  }
+*/
+
+  @Test
+  public void testInvalidAbsoluteURI() {
+    try {
+      client.request(new RequestOptions().setAbsoluteURI("ijdijwidjqwoijd192d192192ej12d"));
+      Assert.fail("Should throw exception");
+    } catch (VertxException e) {
+      //OK
+    }
+  }
+
+  @Test
+  public void testPutHeadersOnRequest() throws Exception {
+    server.requestHandler(req -> {
+      assertEquals("bar", req.headers().get("foo"));
+      assertEquals("bar", req.getHeader("foo"));
+      req.response().end();
+    });
+    startServer(testAddress);
+    Integer sc = client.request(requestOptions)
+      .compose(req -> req
+        .putHeader("foo", "bar")
+        .send()
+        .map(HttpClientResponse::statusCode))
+      .await();
+      assertEquals(200, (int) sc);
+  }
+
+  @Test
+  public void testPutHeaderReplacesPreviousHeaders() throws Exception {
+    server.requestHandler(req ->
+      req.response()
+        .putHeader("Location", "http://example1.org")
+        .putHeader("location", "http://example2.org")
+        .send());
+    startServer(testAddress);
+    String header = client.request(requestOptions)
+      .compose(req -> req
+        .send()
+        .map(resp -> resp.headers().get("LocatioN")))
+      .await();
+    assertEquals("http://example2.org", header);
+  }
+
+  @Test
+  public void testSimpleGET() throws Exception {
+    String uri = "/some-uri?foo=bar";
+    testSimpleRequest(uri, HttpMethod.GET);
+  }
+
+  @Test
+  public void testSimplePUT() throws Exception {
+    String uri = "/some-uri?foo=bar";
+    testSimpleRequest(uri, HttpMethod.PUT);
+  }
+
+  @Test
+  public void testSimplePOST() throws Exception {
+    String uri = "/some-uri?foo=bar";
+    testSimpleRequest(uri, HttpMethod.POST);
+  }
+
+  @Test
+  public void testSimpleDELETE() throws Exception {
+    String uri = "/some-uri?foo=bar";
+    testSimpleRequest(uri, HttpMethod.DELETE);
+  }
+
+  @Test
+  public void testSimpleHEAD() throws Exception {
+    String uri = "/some-uri?foo=bar";
+    testSimpleRequest(uri, HttpMethod.HEAD);
+  }
+
+  @Test
+  public void testSimpleTRACE() throws Exception {
+    String uri = "/some-uri?foo=bar";
+    testSimpleRequest(uri, HttpMethod.TRACE);
+  }
+
+  @Test
+  public void testSimpleCONNECT() throws Exception {
+    String uri = "/some-uri?foo=bar";
+    testSimpleRequest(uri, HttpMethod.CONNECT);
+  }
+
+  @Test
+  public void testSimpleOPTIONS() throws Exception {
+    String uri = "/some-uri?foo=bar";
+    testSimpleRequest(uri, HttpMethod.OPTIONS);
+  }
+
+  @Test
+  public void testSimplePATCH() throws Exception {
+    String uri = "/some-uri?foo=bar";
+    testSimpleRequest(uri, HttpMethod.PATCH);
+  }
+
+  @Test
+  public void testSimpleGETAbsolute() throws Exception {
+    String uri = "/some-uri?foo=bar";
+    testSimpleRequest(uri, HttpMethod.GET, true);
+  }
+
+  @Test
+  public void testEmptyPathGETAbsolute() throws Exception {
+    String uri = "";
+    testSimpleRequest(uri, HttpMethod.GET, true);
+  }
+
+  @Test
+  public void testNoPathButQueryGETAbsolute() throws Exception {
+    String uri = "?foo=bar";
+    testSimpleRequest(uri, HttpMethod.GET, true);
+  }
+
+  @Test
+  public void testSimplePUTAbsolute() throws Exception {
+    String uri = "/some-uri?foo=bar";
+    testSimpleRequest(uri, HttpMethod.PUT, true);
+  }
+
+  @Test
+  public void testSimplePOSTAbsolute() throws Exception {
+    String uri = "/some-uri?foo=bar";
+    testSimpleRequest(uri, HttpMethod.POST, true);
+  }
+
+  @Test
+  public void testSimpleDELETEAbsolute() throws Exception {
+    String uri = "/some-uri?foo=bar";
+    testSimpleRequest(uri, HttpMethod.DELETE, true);
+  }
+
+  @Test
+  public void testSimpleHEADAbsolute() throws Exception {
+    String uri = "/some-uri?foo=bar";
+    testSimpleRequest(uri, HttpMethod.HEAD, true);
+  }
+
+  @Test
+  public void testSimpleTRACEAbsolute() throws Exception {
+    String uri = "/some-uri?foo=bar";
+    testSimpleRequest(uri, HttpMethod.TRACE, true);
+  }
+
+  @Test
+  public void testSimpleCONNECTAbsolute() throws Exception {
+    String uri = "/some-uri?foo=bar";
+    testSimpleRequest(uri, HttpMethod.CONNECT, true);
+  }
+
+  @Test
+  public void testSimpleOPTIONSAbsolute() throws Exception {
+    String uri = "/some-uri?foo=bar";
+    testSimpleRequest(uri, HttpMethod.OPTIONS, true);
+  }
+
+  @Test
+  public void testSimplePATCHAbsolute() throws Exception {
+    String uri = "/some-uri?foo=bar";
+    testSimpleRequest(uri, HttpMethod.PATCH, true);
+  }
+
+  private void testSimpleRequest(String uri, HttpMethod method) throws Exception {
+    testSimpleRequest(uri, method, false);
+  }
+
+  private void testSimpleRequest(String uri, HttpMethod method, boolean absolute) throws Exception {
+    boolean ssl = this instanceof Http2Test || this instanceof Http3Test;
+    RequestOptions options;
+    if (absolute) {
+      options = new RequestOptions(requestOptions).setServer(testAddress).setMethod(method).setAbsoluteURI((ssl ? "https://" : "http://") + config.host() + ":" + config.port() + uri);
+    } else {
+      options = new RequestOptions(requestOptions).setMethod(method).setURI(uri);
+    }
+    testSimpleRequest(uri, method, options, absolute);
+  }
+
+  private void testSimpleRequest(String uri, HttpMethod method, RequestOptions requestOptions, boolean absolute) throws Exception {
+    int index = uri.indexOf('?');
+    String query;
+    String path;
+    if (index == -1) {
+      path = uri;
+      query = null;
+    } else {
+      path = uri.substring(0, index);
+      query = uri.substring(index + 1);
+    }
+    String resource = absolute && path.isEmpty() ? "/" + path : path;
+    server.requestHandler(req -> {
+      String expectedPath = req.method() == HttpMethod.CONNECT && req.version() != HttpVersion.HTTP_1_1 ? null : resource;
+      String expectedQuery = req.method() == HttpMethod.CONNECT && req.version() != HttpVersion.HTTP_1_1 ? null : query;
+      assertEquals(expectedPath, req.path());
+      assertEquals(method, req.method());
+      assertEquals(expectedQuery, req.query());
+      req.response().end();
+    });
+    startServer(testAddress);
+    client.request(requestOptions)
+      .compose(HttpClientRequest::send)
+      .await();
+  }
+
+  @Test
+  public void testResponseEndHandlers1(Checkpoint checkpoint) throws Exception {
+    AtomicInteger cnt = new AtomicInteger();
+    server.requestHandler(req -> {
+      req.response().putHeader("removedheader", "foo");
+      req.response().headersEndHandler(v -> {
+        // Insert another header
+        req.response().putHeader("extraheader", "wibble");
+        req.response().headers().remove("removedheader");
+        assertEquals(0, cnt.getAndIncrement());
+      });
+      req.response().bodyEndHandler(v -> {
+        assertEquals(0, req.response().bytesWritten());
+        assertEquals(1, cnt.getAndIncrement());
+        checkpoint.succeed();
+      });
+      req.response().end();
+    });
+    startServer(testAddress);
+    client.request(requestOptions)
+      .compose(req -> req
+        .send()
+        .map(resp -> {
+          assertEquals(200, resp.statusCode());
+          assertEquals("wibble", resp.headers().get("extraheader"));
+          assertNull(resp.headers().get("removedheader"));
+          return null;
+        }))
+      .await();
+  }
+
+  @Test
+  public void testResponseEndHandlers2(Checkpoint checkpoint) throws Exception {
+    AtomicInteger cnt = new AtomicInteger();
+    String content = "blah";
+    server.requestHandler(req -> {
+      req.response().headersEndHandler(v -> {
+        // Insert another header
+        req.response().putHeader("extraheader", "wibble");
+        assertEquals(0, cnt.getAndIncrement());
+      });
+      req.response().bodyEndHandler(v -> {
+        assertEquals(content.length(), req.response().bytesWritten());
+        assertEquals(1, cnt.getAndIncrement());
+        checkpoint.succeed();
+      });
+      req.response().end(content);
+    });
+    startServer(testAddress);
+    Buffer body = client.request(requestOptions)
+      .compose(req -> req
+        .send()
+        .compose(resp -> {
+          assertEquals(200, resp.statusCode());
+          assertEquals("wibble", resp.headers().get("extraheader"));
+          return resp.body();
+        }))
+      .await();
+    assertEquals(Buffer.buffer(content), body);
+  }
+
+  @Test
+  public void testResponseEndHandlersChunkedResponse(Checkpoint checkpoint) throws Exception {
+    AtomicInteger cnt = new AtomicInteger();
+    String chunk = "blah";
+    int numChunks = 6;
+    StringBuilder content = new StringBuilder(chunk.length() * numChunks);
+    IntStream.range(0, numChunks).forEach(i -> content.append(chunk));
+    server.requestHandler(req -> {
+      req.response().headersEndHandler(v -> {
+        // Insert another header
+        req.response().putHeader("extraheader", "wibble");
+        assertEquals(0, cnt.getAndIncrement());
+      });
+      req.response().bodyEndHandler(v -> {
+        assertEquals(content.length(), req.response().bytesWritten());
+        assertEquals(1, cnt.getAndIncrement());
+        checkpoint.succeed();
+      });
+      req.response().setChunked(true);
+      // note that we have a -1 here because the last chunk is written via end(chunk)
+      IntStream.range(0, numChunks - 1).forEach(x -> req.response().write(chunk));
+      // End with a chunk to ensure size is correctly calculated
+      req.response().end(chunk);
+    });
+    startServer(testAddress);
+    Buffer body = client.request(requestOptions).compose(req -> req
+      .send()
+      .compose(resp -> {
+        assertEquals(200, resp.statusCode());
+        assertEquals("wibble", resp.headers().get("extraheader"));
+        return resp.body();
+      })).await();
+    assertEquals(Buffer.buffer(content.toString()), body);
+  }
+
+  @Test
+  public void testResponseEndHandlersSendFile(Checkpoint checkpoint1, Checkpoint checkpoint2, Checkpoint checkpoint3) throws Exception {
+    AtomicInteger cnt = new AtomicInteger();
+    String content = "iqdioqwdqwiojqwijdwqd";
+    File toSend = setupFile("somefile.txt", content);
+    server.requestHandler(req -> {
+      req.response().headersEndHandler(v -> {
+        // Insert another header
+        req.response().putHeader("extraheader", "wibble");
+        assertEquals(0, cnt.getAndIncrement());
+        checkpoint1.succeed();
+      });
+      req.response().bodyEndHandler(v -> {
+        assertEquals(content.length(), req.response().bytesWritten());
+        assertEquals(1, cnt.getAndIncrement());
+        checkpoint2.succeed();
+      });
+      req.response().endHandler(v -> checkpoint3.succeed());
+      req.response().sendFile(toSend.getAbsolutePath());
+    });
+    startServer(testAddress);
+    Buffer body = client.request(requestOptions).compose(req -> req
+      .send()
+      .compose(resp -> {
+        assertEquals(200, resp.statusCode());
+        assertEquals("wibble", resp.headers().get("extraheader"));
+        return resp.body();
+      })).await();
+    assertEquals(Buffer.buffer(content), body);
+  }
+
+  /**
+   * The headers end handler must see the automatic headers and must be called before the cookies are added, other
+   * projects (e.g. vertx-web) rely on this behavior.
+   */
+  @Test
+  public void testResponseHeadersEndHandlerCalledAfterAutomaticHeadersAndBeforeCookies() throws Exception {
+    String content = "blah";
+    AtomicReference<String> contentLength = new AtomicReference<>();
+    AtomicReference<List<String>> setCookies = new AtomicReference<>();
+    server.requestHandler(req -> {
+      HttpServerResponse resp = req.response();
+      resp.addCookie(Cookie.cookie("the_cookie", "wibble"));
+      resp.headersEndHandler(v -> {
+        contentLength.set(resp.headers().get(HttpHeaders.CONTENT_LENGTH));
+        setCookies.set(resp.headers().getAll(HttpHeaders.SET_COOKIE));
+      });
+      resp.end(content);
+    });
+    startServer(testAddress);
+    HttpClientResponse resp = client.request(requestOptions)
+      .compose(req -> req
+        .send()
+        .compose(r -> r.body().map(r)))
+      .await();
+    assertEquals(200, resp.statusCode());
+    assertEquals(List.of("the_cookie=wibble"), resp.headers().getAll(HttpHeaders.SET_COOKIE));
+    // Automatic headers are set before the headers end handler is called
+    assertEquals(String.valueOf(content.length()), contentLength.get());
+    // Cookies are set after the headers end handler is called
+    assertEquals(List.of(), setCookies.get());
+  }
+
+  @Test
+  public void testAbsoluteURI() throws Exception {
+    String uri = "http://" + config.host() + ":" + config.port() + "/this/is/a/path/foo.html";
+    testURIAndPath(uri, uri, "/this/is/a/path/foo.html");
+  }
+
+  @Test
+  public void testRelativeURI() throws Exception {
+    String uri = "/this/is/a/path/foo.html";
+    testURIAndPath(uri, uri, uri);
+  }
+
+  @Test
+  public void testAbsoluteURIWithHttpSchemaInQuery() throws Exception {
+    String uri = "http://" + config.host() + ":" + config.port() + "/correct/path?url=http://localhost:8008/wrong/path";
+    testURIAndPath(uri, uri, "/correct/path");
+  }
+
+  @Test
+  public void testRelativeURIWithHttpSchemaInQuery() throws Exception {
+    String uri = "/correct/path?url=http://localhost:8008/wrong/path";
+    testURIAndPath(uri, uri, "/correct/path");
+  }
+
+  @Test
+  public void testAbsoluteURIEmptyPath() throws Exception {
+    String uri = "http://" + config.host() + ":" + config.port() + "/";
+    testURIAndPath(uri, uri, "/");
+  }
+
+  @Test
+  public void testEmptyURI() throws Exception {
+    testURIAndPath("", "/", "/");
+  }
+
+  @Test
+  public void testIllegalRequestURIDoesNotDepleteConnectionPool() throws Exception {
+    List<String> received = Collections.synchronizedList(new ArrayList<>());
+    server.requestHandler(req -> {
+      received.add(req.uri());
+      req.response().end();
+    });
+    startServer(testAddress);
+    client.close().await();
+    client = config.forClient()
+      .setMultiplexingLimit(1)
+      .create(vertx, new PoolOptions().setHttp1MaxSize(1).setHttp2MaxSize(1).setHttp3MaxSize(1));
+    // Warm-up request establishing the pooled connection
+    client.request(requestOptions)
+      .compose(req -> req.send().compose(HttpClientResponse::body))
+      .await(10, TimeUnit.SECONDS);
+    try {
+      client.request(new RequestOptions(requestOptions).setURI("/example/ path"))
+        .compose(req -> req.send().compose(HttpClientResponse::body))
+        .await(10, TimeUnit.SECONDS);
+      fail("Request with an illegal URI should fail");
+    } catch (IllegalArgumentException expected) {
+    }
+    // The pooled connection must remain usable
+    client.request(requestOptions)
+      .compose(req -> req.send().compose(HttpClientResponse::body))
+      .await(10, TimeUnit.SECONDS);
+    assertEquals(2, received.size());
+  }
+
+  @Test
+  public void testIllegalRequestURIValidationDisabled() throws Exception {
+    List<String> received = Collections.synchronizedList(new ArrayList<>());
+    server.requestHandler(req -> {
+      received.add(req.uri());
+      req.response().end();
+    });
+    startServer(testAddress);
+    client.close().await();
+    client = config.forClient()
+      .setValidateUri(false)
+      .create(vertx, new PoolOptions().setHttp1MaxSize(1).setHttp2MaxSize(1).setHttp3MaxSize(1));
+    int sc = client.request(new RequestOptions(requestOptions).setURI("/example/ path"))
+      .compose(req -> req.send().map(HttpClientResponse::statusCode))
+      .await(10, TimeUnit.SECONDS);
+    if (sc == 200) {
+      // The server accepted the raw URI (HTTP/2, HTTP/3)
+      assertEquals(List.of("/example/ path"), received);
+    } else {
+      // The server rejected the raw request line (HTTP/1.1)
+      assertEquals(400, sc);
+      assertEquals(List.of(), received);
+    }
+    // The pooled connection must remain usable
+    client.request(requestOptions)
+      .compose(req -> req.send().compose(HttpClientResponse::body))
+      .await(10, TimeUnit.SECONDS);
+    assertEquals(DEFAULT_TEST_URI, received.get(received.size() - 1));
+  }
+
+  @Test
+  public void testIllegalRequestURISetter() throws Exception {
+    server.requestHandler(req -> req.response().end(req.uri()));
+    startServer(testAddress);
+    Buffer body = client.request(requestOptions)
+      .compose(req -> {
+        try {
+          req.setURI("/example/ path");
+          fail("Setting an illegal URI should fail");
+        } catch (IllegalArgumentException expected) {
+        }
+        return req.send().compose(HttpClientResponse::body);
+      })
+      .await(10, TimeUnit.SECONDS);
+    assertEquals(DEFAULT_TEST_URI, body.toString());
+  }
+
+  @Test
+  public void testIllegalRequestURIConnectionRequest() throws Exception {
+    server.requestHandler(req -> req.response().end());
+    startServer(testAddress);
+    HttpClientConnection conn = client.connect(new HttpConnectOptions().setServer(testAddress)).await();
+    try {
+      conn.request(new RequestOptions(requestOptions).setURI("/example/ path"))
+        .compose(req -> req.send().compose(HttpClientResponse::body))
+        .await(10, TimeUnit.SECONDS);
+      fail("Request with an illegal URI should fail");
+    } catch (IllegalArgumentException expected) {
+    }
+    // The connection must remain usable
+    conn.request(requestOptions)
+      .compose(req -> req.send().compose(HttpClientResponse::body))
+      .await(10, TimeUnit.SECONDS);
+  }
+
+  @Test
+  public void testParams() throws Exception {
+    server.requestHandler(req -> {
+      MultiMap params1 = req.params(true);
+      MultiMap params2 = req.params(true);
+      assertSame(params1, params2); // got the cached value
+      MultiMap params3 = req.params(false);
+      assertNotSame(params1, params3); // cache refreshed
+      MultiMap params4 = req.params(false);
+      assertSame(params3, params4); // got the cached value
+
+      assertEquals(params1.get("a"), "1;b=2");
+      assertEquals(params3.get("a"), "1");
+
+      req.response().end();
+    });
+    startServer(testAddress);
+    client.request(new RequestOptions(requestOptions).setURI("/?a=1;b=2&c=3"))
+      .compose(req -> req
+        .send()
+        .compose(resp -> {
+          assertEquals(200, resp.statusCode());
+          return resp.end();
+        }))
+      .await();
+  }
+
+  private void testURIAndPath(String uri, String expectedUri, String expectedPath) throws Exception {
+    server.requestHandler(req -> {
+      assertEquals(expectedUri, req.uri());
+      assertEquals(expectedPath, req.path());
+      req.response().end();
+    });
+    startServer(testAddress);
+    client.request(new RequestOptions(requestOptions).setURI(uri))
+      .compose(req -> req
+        .send()
+        .compose(resp -> {
+          assertEquals(200, resp.statusCode());
+          return resp.end();
+        }))
+      .await();
+  }
+
+  @Test
+  public void testParamsAmpersand() throws Exception {
+    testParams('&');
+  }
+
+  @Test
+  public void testParamsSemiColon() throws Exception {
+    testParams(';');
+  }
+
+  private void testParams(char delim) throws Exception {
+    MultiMap params = TestUtils.randomMultiMap(10);
+    String query = generateQueryString(params, delim);
+    server.requestHandler(req -> {
+      assertEquals(query, req.query());
+      assertEquals(params.size(), req.params().size());
+      for (Map.Entry<String, String> entry : req.params()) {
+        assertEquals(entry.getValue(), params.get(entry.getKey()));
+      }
+      req.response().end();
+    });
+    startServer(testAddress);
+    sendAndAwait(new RequestOptions(requestOptions).setURI("some-uri/?" + query));
+  }
+
+  @Test
+  public void testNoParams() throws Exception {
+    server.requestHandler(req -> {
+      assertNull(req.query());
+      assertTrue(req.params().isEmpty());
+      req.response().end();
+    });
+    startServer(testAddress);
+    sendAndAwait(requestOptions);
+  }
+
+  @Test
+  public void testOverrideParamsCharset() throws Exception {
+    server.requestHandler(req -> {
+      String val = req.getParam("param");
+      assertEquals("\u20AC", val); // Euro sign
+      req.setParamsCharset(StandardCharsets.ISO_8859_1.name());
+      val = req.getParam("param");
+      assertEquals("\u00E2\u0082\u00AC", val);
+      req.response().end();
+    });
+    startServer(testAddress);
+    sendAndAwait(new RequestOptions(requestOptions).setURI("/?param=%E2%82%AC"));
+  }
+
+  @Test
+  public void testGetParamDefaultValue() throws Exception {
+    String paramName1 = "foo";
+    String paramName1Value = "bar";
+    String paramName2 = "notPresentParam";
+    String paramName2DefaultValue = "defaultValue";
+    String reqUri = DEFAULT_TEST_URI + "/?" + paramName1 + "=" + paramName1Value;
+
+    server.requestHandler(req -> {
+      assertTrue(req.params().contains(paramName1));
+      assertEquals(paramName1Value, req.getParam(paramName1, paramName2DefaultValue));
+      assertFalse(req.params().contains(paramName2));
+      assertEquals(paramName2DefaultValue, req.getParam(paramName2, paramName2DefaultValue));
+      req.response().end();
+    });
+    startServer(testAddress);
+    sendAndAwait(new RequestOptions(requestOptions).setURI(reqUri));
+  }
+
+  @Test
+  public void testConfigureQueryParamsCharsetDecoding() throws Exception {
+    testConfigureQueryParamsDecoding(
+      new QueryParamDecoderConfig().setCharset(StandardCharsets.ISO_8859_1),
+      "/?param=%E2%82%AC",
+      request -> {
+        MultiMap defaultParams = request.params();
+        String val = defaultParams.get("param");
+        assertEquals("\u00E2\u0082\u00AC", val);
+      });
+  }
+
+  @Test
+  public void testConfigureQueryParamsSemicolonDelimiterDecodingWithSemicolonDelimiterDecoding() throws Exception {
+    testConfigureQueryParamsDecoding(
+      new QueryParamDecoderConfig().setUseSemicolonAsDelimiter(false),
+      "/some?a=b&c=d;e=f",
+      request -> {
+        Map<String, String> expected1 = Map.of("a", "b", "c", "d;e=f");
+        Map<String, String> expected2 = Map.of("a", "b", "c", "d", "e", "f");
+        MultiMap params;
+        params = request.params();
+        assertEquals(expected1.size(), params.size());
+        for (Map.Entry<String, String> entry : params) {
+          assertEquals(entry.getValue(), expected1.get(entry.getKey()));
+        }
+        params = request.params(true);
+        assertEquals(expected1.size(), params.size());
+        for (Map.Entry<String, String> entry : params) {
+          assertEquals(entry.getValue(), expected1.get(entry.getKey()));
+        }
+        params = request.params(false);
+        assertEquals(expected2.size(), params.size());
+        for (Map.Entry<String, String> entry : params) {
+          assertEquals(entry.getValue(), expected2.get(entry.getKey()));
+        }
+        params = request.params();
+        assertEquals(expected1.size(), params.size());
+        for (Map.Entry<String, String> entry : params) {
+          assertEquals(entry.getValue(), expected1.get(entry.getKey()));
+        }
+      });
+  }
+
+  @Test
+  public void testConfigureQueryParamsSemicolonDelimiterDecodingWithoutSemicolonDelimiterDecoding() throws Exception {
+    testConfigureQueryParamsDecoding(
+      new QueryParamDecoderConfig().setUseSemicolonAsDelimiter(true),
+      "/some?a=b&c=d;e=f",
+      request -> {
+        Map<String, String> expected1 = Map.of("a", "b", "c", "d", "e", "f");
+        Map<String, String> expected2 = Map.of("a", "b", "c", "d;e=f");
+        MultiMap params;
+        params = request.params();
+        assertEquals(expected1.size(), params.size());
+        for (Map.Entry<String, String> entry : params) {
+          assertEquals(entry.getValue(), expected1.get(entry.getKey()));
+        }
+        params = request.params(false);
+        assertEquals(expected1.size(), params.size());
+        for (Map.Entry<String, String> entry : params) {
+          assertEquals(entry.getValue(), expected1.get(entry.getKey()));
+        }
+        params = request.params(true);
+        assertEquals(expected2.size(), params.size());
+        for (Map.Entry<String, String> entry : params) {
+          assertEquals(entry.getValue(), expected2.get(entry.getKey()));
+        }
+        params = request.params();
+        assertEquals(expected1.size(), params.size());
+        for (Map.Entry<String, String> entry : params) {
+          assertEquals(entry.getValue(), expected1.get(entry.getKey()));
+        }
+      });
+  }
+
+  @Test
+  public void testConfigureQueryParamsMaxSizeDecoding() throws Exception {
+    int maxSize = 10;
+    MultiMap params = TestUtils.randomMultiMap(maxSize + 1);
+    testConfigureQueryParamsDecoding(
+      new QueryParamDecoderConfig().setMaxSize(maxSize),
+      "/some?" + generateQueryString(params, '&'),
+      request -> {
+        MultiMap defaultParams = request.params();
+        assertEquals(maxSize, defaultParams.size());
+        for (Map.Entry<String, String> entry : defaultParams) {
+          assertEquals(entry.getValue(), defaultParams.get(entry.getKey()));
+        }
+      });
+  }
+
+  private void testConfigureQueryParamsDecoding(QueryParamDecoderConfig queryParamDecoderConfig, String uri, Consumer<HttpServerRequest> checker) throws Exception {
+    server = vertx.httpServerBuilder()
+      .with(config.forServer()
+        .config().setQueryParamConfig(queryParamDecoderConfig))
+      .with(config.forServer().sslOptions())
+      .build();
+    try {
+      server.requestHandler(req -> {
+        checker.accept(req);
+        req.response().end();
+      });
+      startServer(testAddress);
+      sendAndAwait(new RequestOptions(requestOptions).setURI(uri));
+    } finally {
+      server.close().await();
+    }
+  }
+
+  @Test
+  public void testDefaultRequestHeaders() throws Exception {
+    server.requestHandler(req -> {
+      if (req.version() == HttpVersion.HTTP_1_1) {
+        assertEquals(1, req.headers().size());
+        assertEquals(config.host() + ":" + config.port(), req.headers().get("host"));
+      } else {
+        assertEquals(0, req.headers().size());
+      }
+      req.response().end();
+    });
+    startServer(testAddress);
+    sendAndAwait(requestOptions);
+  }
+
+  private void sendAndAwait(RequestOptions request) {
+    sendAndAwait(request, req -> {});
+  }
+
+  private void sendAndAwait(RequestOptions request, Handler<HttpClientRequest> handler) {
+    client.request(request)
+      .compose(req -> {
+        handler.handle(req);
+        return req
+          .send()
+          .compose(resp -> {
+            assertEquals(200, resp.statusCode());
+            return resp.end();
+          });
+      })
+      .await();
+  }
+
+  @Test
+  public void testRequestHeadersWithCharSequence() throws Exception {
+    HashMap<CharSequence, String> expectedHeaders = new HashMap<>();
+    expectedHeaders.put(HttpHeaderNames.CONTENT_TYPE, "text/html; charset=utf-8");
+    expectedHeaders.put(HttpHeaderNames.CONTENT_ENCODING, "gzip");
+    expectedHeaders.put(HttpHeaderNames.USER_AGENT, "Mozilla/5.0");
+
+    server.requestHandler(req -> {
+
+      MultiMap headers = req.headers();
+      headers.remove("host");
+
+      assertEquals(expectedHeaders.size(), headers.size());
+
+      expectedHeaders.forEach((k, v) -> assertEquals(v, headers.get(k)));
+      expectedHeaders.forEach((k, v) -> assertEquals(v, req.getHeader(k)));
+
+      req.response().end();
+    });
+    startServer(testAddress);
+    sendAndAwait(requestOptions, req -> {
+      expectedHeaders.forEach((k, v) -> req.headers().set(k, v));
+    });
+  }
+
+  @Test
+  public void testRequestHeadersPutAll() throws Exception {
+    testRequestHeaders(false);
+  }
+
+  @Test
+  public void testRequestHeadersIndividually() throws Exception {
+    testRequestHeaders(true);
+  }
+
+  private void testRequestHeaders(boolean individually) throws Exception {
+    MultiMap expectedHeaders = randomMultiMap(10);
+
+    server.requestHandler(req -> {
+      MultiMap headers = req.headers();
+      headers.remove("host");
+      assertEquals(expectedHeaders.size(), expectedHeaders.size());
+      for (Map.Entry<String, String> entry : expectedHeaders) {
+        assertEquals(entry.getValue(), req.headers().get(entry.getKey()));
+        assertEquals(entry.getValue(), req.getHeader(entry.getKey()));
+      }
+      req.response().end();
+    });
+    startServer(testAddress);
+    sendAndAwait(requestOptions, req -> {
+      if (individually) {
+        for (Map.Entry<String, String> header : expectedHeaders) {
+          req.headers().add(header.getKey(), header.getValue());
+        }
+      } else {
+        req.headers().setAll(expectedHeaders);
+      }
+    });
+  }
+
+  @Test
+  public void testResponseHeadersPutAll() throws Exception {
+    testResponseHeaders(false);
+  }
+
+  @Test
+  public void testResponseHeadersIndividually() throws Exception {
+    testResponseHeaders(true);
+  }
+
+  private void testResponseHeaders(boolean individually) throws Exception {
+    MultiMap headers = randomMultiMap(10);
+
+    server.requestHandler(req -> {
+      if (individually) {
+        for (Map.Entry<String, String> header : headers) {
+          req.response().headers().add(header.getKey(), header.getValue());
+        }
+      } else {
+        req.response().headers().setAll(headers);
+      }
+      req.response().end();
+    });
+    startServer(testAddress);
+    MultiMap respHeaders = client.request(requestOptions)
+      .compose(req -> req
+        .send()
+        .compose(resp -> resp.end().map(resp.headers())))
+      .await();
+    assertTrue(headers.size() < respHeaders.size());
+    for (Map.Entry<String, String> entry : headers) {
+      assertEquals(entry.getValue(), respHeaders.get(entry.getKey()));
+    }
+  }
+
+  @Test
+  public void testResponseHeadersWithCharSequence() throws Exception {
+    HashMap<CharSequence, String> headers = new HashMap<>();
+    headers.put(HttpHeaderNames.CONTENT_TYPE, "text/html; charset=utf-8");
+    headers.put(HttpHeaderNames.CONTENT_ENCODING, "gzip");
+    headers.put(HttpHeaderNames.USER_AGENT, "Mozilla/5.0");
+
+    server.requestHandler(req -> {
+      headers.forEach((k, v) -> req.response().headers().add(k, v));
+      req.response().end();
+    });
+
+    startServer(testAddress);
+
+    MultiMap respHeaders = client.request(requestOptions)
+      .compose(req -> req
+        .send()
+        .compose(resp -> resp.end().map(resp.headers())))
+      .await();
+    assertTrue(headers.size() < respHeaders.size());
+    headers.forEach((k, v) -> assertEquals(v, respHeaders.get(k)));
+  }
+
+  @Test
+  public void testResponseMultipleSetCookieInHeader() throws Exception {
+    testResponseMultipleSetCookie(true, false);
+  }
+
+  @Test
+  public void testResponseMultipleSetCookieInTrailer() throws Exception {
+    testResponseMultipleSetCookie(false, true);
+  }
+
+  @Test
+  public void testResponseMultipleSetCookieInHeaderAndTrailer() throws Exception {
+    testResponseMultipleSetCookie(true, true);
+  }
+
+  private void testResponseMultipleSetCookie(boolean inHeader, boolean inTrailer) throws Exception {
+    List<String> cookies = new ArrayList<>();
+
+    server.requestHandler(req -> {
+      if (inHeader) {
+        List<String> headers = new ArrayList<>();
+        headers.add("h1=h1v1");
+        headers.add("h2=h2v2; Expires=Wed, 09-Jun-2021 10:18:14 GMT");
+        cookies.addAll(headers);
+        req.response().headers().set("Set-Cookie", headers);
+      }
+      if (inTrailer) {
+        req.response().setChunked(true);
+        List<String> trailers = new ArrayList<>();
+        trailers.add("t1=t1v1");
+        trailers.add("t2=t2v2; Expires=Wed, 09-Jun-2021 10:18:14 GMT");
+        cookies.addAll(trailers);
+        req.response().trailers().set("Set-Cookie", trailers);
+      }
+      req.response().end();
+    });
+
+    startServer(testAddress);
+
+    List<String> respCookies = client.request(requestOptions).compose(req -> req
+        .send()
+        .compose(resp -> {
+          assertEquals(200, resp.statusCode());
+          return resp.end().map(v -> resp.cookies());
+        }))
+      .await();
+    assertEquals(cookies.size(), respCookies.size());
+    for (int i = 0; i < cookies.size(); ++i) {
+      assertEquals(cookies.get(i), respCookies.get(i));
+    }
+  }
+
+  @Test
+  public void testUseRequestAfterComplete(Checkpoint checkpoint) throws Exception {
+    server.requestHandler(v -> {});
+
+    startServer(testAddress);
+
+    client.request(requestOptions).onComplete(TestUtils.onSuccess(req -> {
+      req.end();
+
+      Buffer buff = Buffer.buffer();
+      assertIllegalStateExceptionAsync(() -> req.end());
+      assertIllegalStateException(() -> req.continueHandler(v -> {}));
+      assertIllegalStateException(() -> req.drainHandler(v -> {}));
+      assertIllegalStateExceptionAsync(() -> req.end("foo"));
+      assertIllegalStateExceptionAsync(() -> req.end(buff));
+      assertIllegalStateExceptionAsync(() -> req.end("foo", "UTF-8"));
+      assertIllegalStateException(() -> req.writeHead());
+      assertIllegalStateException(() -> req.setChunked(false));
+      assertIllegalStateException(() -> req.setWriteQueueMaxSize(123));
+      assertIllegalStateExceptionAsync(() -> req.write(buff));
+      assertIllegalStateExceptionAsync(() -> req.write("foo"));
+      assertIllegalStateExceptionAsync(() -> req.write("foo", "UTF-8"));
+      assertIllegalStateExceptionAsync(() -> req.write(buff));
+      assertIllegalStateException(() -> req.writeQueueFull());
+
+      checkpoint.succeed();
+    }));
+  }
+
+  @Test
+  public void testWriteHeadTwice() throws Exception {
+    server.requestHandler(req -> req.end().onComplete(v -> req.response().end()));
+    startServer(testAddress);
+    HttpClientRequest req = client.request(new RequestOptions(requestOptions).setMethod(HttpMethod.POST)).await();
+    req.writeHead().await();
+    Future<Void> second = req.writeHead();
+    assertThatThrownBy(second::await).hasMessage("Head already sent");
+    req.end().compose(v -> req.response()).compose(HttpClientResponse::end).await();
+  }
+
+  @Test
+  public void testRequestBodyBufferAtEnd() throws Exception {
+    Buffer body = TestUtils.randomBuffer(1000);
+    server.requestHandler(req -> req.bodyHandler(buffer -> {
+      assertEquals(body, buffer);
+      req.response().end();
+    }));
+
+    startServer(testAddress);
+    client.request(new RequestOptions(requestOptions).setMethod(HttpMethod.PUT))
+      .compose(req -> req
+        .send(body)
+        .compose(resp -> {
+          assertEquals(200, resp.statusCode());
+          return resp.end();
+        }))
+      .await();
+  }
+
+  @Test
+  public void testRequestBodyStringDefaultEncodingAtEnd() throws Exception {
+    testRequestBodyStringAtEnd(null);
+  }
+
+  @Test
+  public void testRequestBodyStringUTF8AtEnd() throws Exception {
+    testRequestBodyStringAtEnd("UTF-8");
+  }
+
+  @Test
+  public void testRequestBodyStringUTF16AtEnd() throws Exception {
+    testRequestBodyStringAtEnd("UTF-16");
+  }
+
+  private void testRequestBodyStringAtEnd(String encoding) throws Exception {
+    String body = TestUtils.randomUnicodeString(1000);
+    Buffer bodyBuff;
+
+    if (encoding == null) {
+      bodyBuff = Buffer.buffer(body);
+    } else {
+      bodyBuff = Buffer.buffer(body, encoding);
+    }
+
+    server.requestHandler(req -> {
+      req.bodyHandler(buffer -> {
+        assertEquals(bodyBuff, buffer);
+        req.response().end();
+      });
+    });
+
+    startServer(testAddress);
+
+    client
+      .request(requestOptions)
+      .compose(req -> {
+        Future<Void> fut;
+        if (encoding == null) {
+          fut = req.end(body);
+        } else {
+          fut = req.end(body, encoding);
+        }
+        return fut
+          .compose(v -> req
+            .response()
+            .compose(HttpClientResponse::end));
+      })
+      .await();
+  }
+
+  @Test
+  public void testRequestBodyWriteChunked() throws Exception {
+    testRequestBodyWrite(true);
+  }
+
+  @Test
+  public void testRequestBodyWriteNonChunked() throws Exception {
+    testRequestBodyWrite(false);
+  }
+
+  private void testRequestBodyWrite(boolean chunked) throws Exception {
+    Buffer body = Buffer.buffer();
+
+    server.requestHandler(req -> {
+      req.bodyHandler(buffer -> {
+        assertEquals(body, buffer);
+        req.response().end();
+      });
+    });
+
+    startServer(testAddress);
+
+    client.request(new RequestOptions(requestOptions).setMethod(HttpMethod.PUT))
+      .compose(req -> {
+        int numWrites = 10;
+        int chunkSize = 100;
+        if (chunked) {
+          req.setChunked(true);
+        } else {
+          req.headers().set("Content-Length", String.valueOf(numWrites * chunkSize));
+        }
+        for (int i = 0; i < numWrites; i++) {
+          Buffer b = TestUtils.randomBuffer(chunkSize);
+          body.appendBuffer(b);
+          req.write(b);
+        }
+        req.end();
+        return req.response().compose(resp -> {
+          assertEquals(200, resp.statusCode());
+          return resp.end();
+        });
+      }).await();
+  }
+
+  @Test
+  public void testRequestBodyWriteStringChunkedDefaultEncoding() throws Exception {
+    testRequestBodyWriteString(true, null);
+  }
+
+  @Test
+  public void testRequestBodyWriteStringChunkedUTF8() throws Exception {
+    testRequestBodyWriteString(true, "UTF-8");
+  }
+
+  @Test
+  public void testRequestBodyWriteStringChunkedUTF16() throws Exception {
+    testRequestBodyWriteString(true, "UTF-16");
+  }
+
+  @Test
+  public void testRequestBodyWriteStringNonChunkedDefaultEncoding() throws Exception {
+    testRequestBodyWriteString(false, null);
+  }
+
+  @Test
+  public void testRequestBodyWriteStringNonChunkedUTF8() throws Exception {
+    testRequestBodyWriteString(false, "UTF-8");
+  }
+
+  @Test
+  public void testRequestBodyWriteStringNonChunkedUTF16() throws Exception {
+    testRequestBodyWriteString(false, "UTF-16");
+  }
+
+  private void testRequestBodyWriteString(boolean chunked, String encoding) throws Exception {
+    String body = TestUtils.randomUnicodeString(1000);
+    Buffer bodyBuff;
+
+    if (encoding == null) {
+      bodyBuff = Buffer.buffer(body);
+    } else {
+      bodyBuff = Buffer.buffer(body, encoding);
+    }
+
+    server.requestHandler(req -> {
+      req.bodyHandler(buff -> {
+        assertEquals(bodyBuff, buff);
+        req.response().end();
+      });
+    });
+
+    startServer(testAddress);
+
+    client
+      .request(new RequestOptions(requestOptions).setMethod(HttpMethod.PUT))
+      .compose(req -> {
+        if (chunked) {
+          req.setChunked(true);
+        } else {
+          req.headers().set("Content-Length", String.valueOf(bodyBuff.length()));
+        }
+        if (encoding == null) {
+          req.write(body);
+        } else {
+          req.write(body, encoding);
+        }
+        return req.end()
+          .compose(v -> req
+            .response()
+            .compose(HttpClientResponse::end));
+      }).await();
+  }
+
+  @Test
+  public void testRequestWrite() throws Exception {
+    int times = 3;
+    Buffer chunk = TestUtils.randomBuffer(1000);
+    server.requestHandler(req -> {
+      req.bodyHandler(buff -> {
+        Buffer expected = Buffer.buffer();
+        for (int i = 0;i < times;i++) {
+          expected.appendBuffer(chunk);
+        }
+        assertEquals(expected, buff);
+        req.response().end();
+      });
+    });
+    startServer(testAddress);
+    client.request(new RequestOptions(requestOptions).setMethod(HttpMethod.PUT))
+      .compose(req -> {
+        req.setChunked(true);
+        int padding = 5;
+        for (int i = 0;i < times;i++) {
+          Buffer paddedChunk = TestUtils.leftPad(padding, chunk);
+          req.write(paddedChunk);
+        }
+        return req.end()
+          .compose(v -> req
+            .response()
+            .compose(HttpClientResponse::end));
+      }).await();
+  }
+
+  @Repeat(times = 10)
+  @Test
+  public void testClientExceptionHandlerCalledWhenServerTerminatesConnection() throws Exception {
+    int numReqs = 1;
+    server.requestHandler(request -> {
+      request.connection().close();
+    });
+    startServer(testAddress);
+    // Exception handler should be called for any requests in the pipeline if connection is closed
+    for (int i = 0; i < numReqs; i++) {
+      try {
+        client.request(requestOptions)
+          .compose(HttpClientRequest::send)
+          .await();
+        Assert.fail();
+      } catch (Exception expected) {
+      }
+    }
+  }
+
+  @Test
+  public void testClientExceptionHandlerCalledWhenServerTerminatesConnectionAfterPartialResponse(Checkpoint checkpoint) throws Exception {
+    AtomicReference<HttpConnection> connection = new AtomicReference<>();
+    server.requestHandler(request -> {
+      //Write partial response then close connection before completing it
+      connection.set(request.connection());
+      HttpServerResponse resp = request.response().setChunked(true);
+      resp.write("foo");
+    });
+    startServer(testAddress);
+    // Exception handler should be called for any requests in the pipeline if connection is closed
+    client.request(requestOptions).onComplete(TestUtils.onSuccess(req -> {
+      req.send().onComplete(TestUtils.onSuccess(resp -> {
+        resp.exceptionHandler(atMostOnce(t -> {
+          checkpoint.succeed();
+        }));
+        connection.get().close();
+      }));
+    }));
+  }
+
+  @Test
+  public void testContextExceptionHandlerCalledWhenExceptionOnDataHandler(Checkpoint checkpoint) throws Exception {
+    server.requestHandler(request -> {
+      request.response().end("foo");
+    });
+    startServer(testAddress);
+    // Exception handler should be called for any exceptions in the data handler
+    Context ctx = vertx.getOrCreateContext();
+    ctx.runOnContext(v -> {
+      RuntimeException cause = new RuntimeException("should be caught");
+      ctx.exceptionHandler(err -> {
+        if (err == cause) {
+          checkpoint.succeed();
+        }
+      });
+      client = createHttpClient();
+      client.request(requestOptions).onComplete(TestUtils.onSuccess(req -> {
+        req.send().onComplete(TestUtils.onSuccess(resp -> {
+          resp.handler(data -> {
+            throw cause;
+          });
+        }));
+      }));
+    });
+  }
+
+  @Test
+  public void testClientExceptionHandlerCalledWhenExceptionOnBodyHandler(Checkpoint checkpoint) throws Exception {
+    server.requestHandler(request -> {
+      request.response().end("foo");
+    });
+    startServer(testAddress);
+    client = createHttpClient();
+    // Exception handler should be called for any exceptions in the data handler
+    Context ctx = vertx.getOrCreateContext();
+    RuntimeException cause = new RuntimeException("should be caught");
+    ctx.runOnContext(v -> {
+      ctx.exceptionHandler(err -> {
+        if (err == cause) {
+          checkpoint.succeed();
+        }
+      });
+      client.request(requestOptions).onComplete(TestUtils.onSuccess(req -> {
+        req.send().onComplete(TestUtils.onSuccess(resp -> {
+          resp.bodyHandler(data -> {
+            throw cause;
+          });
+        }));
+      }));
+    });
+  }
+
+  @Test
+  public void testClientRequestExceptionHandlerCalledWhenConnectionClosed(Checkpoint checkpoint) throws Exception {
+    server.requestHandler(req -> {
+      req.handler(buff -> {
+        req.connection().close();
+      });
+    });
+    startServer(testAddress);
+    client.request(new RequestOptions(requestOptions).setMethod(HttpMethod.PUT))
+      .onComplete(TestUtils.onSuccess(req -> {
+      req.setChunked(true);
+      req.exceptionHandler(err -> {
+        checkpoint.succeed();
+      });
+      req.write("chunk");
+    }));
+  }
+
+  @Test
+  public void testClientResponseExceptionHandlerCalledWhenConnectionClosed(Checkpoint checkpoint) throws Exception {
+    AtomicReference<HttpConnection> conn = new AtomicReference<>();
+    server.requestHandler(req -> {
+      conn.set(req.connection());
+      req.response().setChunked(true).write("chunk");
+    });
+    startServer(testAddress);
+    client.request(requestOptions).onComplete(TestUtils.onSuccess(req -> {
+      req.send().onComplete(TestUtils.onSuccess(resp -> {
+        resp.handler(buff -> {
+          conn.get().close();
+        });
+        resp.exceptionHandler(atMostOnce(err -> {
+          checkpoint.succeed();
+        }));
+      }));
+    }));
+  }
+
+  @Test
+  public void testClientRequestExceptionHandlerCalledWhenRequestEnded(Checkpoint checkpoint1, Checkpoint checkpoint2) throws Exception {
+    server.requestHandler(req -> {
+      req.connection().close();
+    });
+    startServer(testAddress);
+    client.request(requestOptions).onComplete(TestUtils.onSuccess(req -> {
+      req
+        .exceptionHandler(err -> Assert.fail(err.getMessage()))
+        .send().onComplete(TestUtils.onFailure(err -> {
+          checkpoint1.succeed();
+        }));
+      try {
+        req.exceptionHandler(err -> Assert.fail());
+        Assert.fail();
+      } catch (Exception e) {
+        checkpoint2.succeed();
+      }
+    }));
+  }
+
+  @Test
+  public void testDefaultStatus() throws Exception {
+    testStatusCode(-1, null);
+  }
+
+  @Test
+  public void testDefaultOther() throws Exception {
+    // Doesn't really matter which one we choose
+    testStatusCode(405, null);
+  }
+
+  @Test
+  public void testOverrideStatusMessage() throws Exception {
+    testStatusCode(404, "some message");
+  }
+
+  @Test
+  public void testOverrideDefaultStatusMessage() throws Exception {
+    testStatusCode(-1, "some other message");
+  }
+
+  private void testStatusCode(int code, String statusMessage) throws Exception {
+    server.requestHandler(req -> {
+      if (code != -1) {
+        req.response().setStatusCode(code);
+      }
+      if (statusMessage != null) {
+        req.response().setStatusMessage(statusMessage);
+      }
+      req.response().end();
+    });
+    startServer(testAddress);
+    client.request(requestOptions).compose(req -> req
+      .send()
+      .compose(resp -> {
+        int theCode;
+        if (code == -1) {
+          // Default code - 200
+          assertEquals(200, resp.statusCode());
+          theCode = 200;
+        } else {
+          theCode = code;
+        }
+        if (statusMessage != null && resp.version() == HttpVersion.HTTP_1_1) {
+          assertEquals(statusMessage, resp.statusMessage());
+        } else {
+          assertEquals(HttpResponseStatus.valueOf(theCode).reasonPhrase(), resp.statusMessage());
+        }
+        return resp.end();
+      })).await();
+  }
+
+  @Test
+  public void testResponseTrailersPutAll() throws Exception {
+    testResponseTrailers(false);
+  }
+
+  @Test
+  public void testResponseTrailersPutIndividually() throws Exception {
+    testResponseTrailers(true);
+  }
+
+  private void testResponseTrailers(boolean individually) throws Exception {
+    MultiMap trailers = randomMultiMap(10);
+
+    server.requestHandler(req -> {
+      req.response().setChunked(true);
+      if (individually) {
+        for (Map.Entry<String, String> header : trailers) {
+          req.response().trailers().add(header.getKey(), header.getValue());
+        }
+      } else {
+        req.response().trailers().setAll(trailers);
+      }
+      req.response().end();
+    });
+    startServer(testAddress);
+    client.request(requestOptions)
+      .compose(req -> req
+        .send()
+        .compose(resp -> {
+          assertEquals(200, resp.statusCode());
+          return resp.end().map(v -> resp.trailers());
+        }))
+      .onComplete(TestUtils.onSuccess(respTrailers -> {
+        assertEquals(trailers.size(), respTrailers.size());
+        for (Map.Entry<String, String> entry : trailers) {
+          assertEquals(entry.getValue(), respTrailers.get(entry.getKey()));
+        }
+      })).await();
+  }
+
+  @Test
+  public void testResponseNoTrailers() throws Exception {
+    server.requestHandler(req -> {
+      req.response().setChunked(true);
+      req.response().end();
+    });
+    startServer(testAddress);
+    MultiMap trailers = client.request(requestOptions)
+      .compose(req -> req
+        .send()
+        .compose(resp -> {
+          assertEquals(200, resp.statusCode());
+          return resp.end().map(v -> resp.trailers());
+        }))
+      .await();
+    assertTrue(trailers.isEmpty());
+  }
+
+  @Test
+  public void testRequestTrailers() throws Exception {
+    testRequestTrailers("the-body", req -> req.end("the-body"));
+  }
+
+  @Test
+  public void testRequestTrailersWithoutBody() throws Exception {
+    testRequestTrailers("", HttpClientRequest::end);
+  }
+
+  @Test
+  public void testRequestTrailersStreamedBody() throws Exception {
+    testRequestTrailers("the-body", req -> {
+      req.write("the-");
+      return req.end("body");
+    });
+  }
+
+  private void testRequestTrailers(String expectedBody, Function<HttpClientRequest, Future<Void>> sender) throws Exception {
+    server.requestHandler(req -> req.body().onComplete(TestUtils.onSuccess(body -> {
+      assertEquals(expectedBody, body.toString());
+      assertEquals("foo_value", req.getTrailer("foo"));
+      assertEquals("bar_value", req.trailers().get("Bar"));
+      assertEquals(List.of("juu_value_1", "juu_value_2"), req.trailers().getAll("juu"));
+      assertNull(req.headers().get("foo"));
+      req.response().end();
+    })));
+    startServer(testAddress);
+    client.request(new RequestOptions(requestOptions).setMethod(HttpMethod.POST))
+      .compose(req -> {
+        req.putTrailer("foo", "foo_value");
+        req.trailers().set("bar", "bar_value");
+        List<String> juu = List.of("juu_value_1", "juu_value_2");
+        req.putTrailer("juu", juu);
+        Future<HttpClientResponse> response = req.response();
+        return sender.apply(req).compose(v -> response);
+      })
+      .compose(resp -> {
+        assertEquals(200, resp.statusCode());
+        return resp.end();
+      })
+      .await();
+  }
+
+  @Test
+  public void testRequestNoTrailers() throws Exception {
+    server.requestHandler(req -> req.end().onComplete(TestUtils.onSuccess(v -> {
+      assertTrue(req.trailers().isEmpty());
+      assertNull(req.getTrailer("foo"));
+      req.response().end();
+    })));
+    startServer(testAddress);
+    client.request(new RequestOptions(requestOptions).setMethod(HttpMethod.POST))
+      .compose(req -> req
+        .send("the-body")
+        .compose(HttpClientResponse::end))
+      .await();
+  }
+
+  @Test
+  public void testRequestForbiddenTrailer() throws Exception {
+    server.requestHandler(req -> fail("Unexpected request"));
+    startServer(testAddress);
+    for (String name : List.of("content-length", "Transfer-Encoding", "trailer", "host", "authorization", "cookie", "te")) {
+      HttpClientRequest req = client.request(new RequestOptions(requestOptions).setMethod(HttpMethod.POST)).await();
+      req.putTrailer(name, "value");
+      assertThatThrownBy(() -> req.end("the-body").await()).isInstanceOf(IllegalArgumentException.class);
+      assertThatThrownBy(() -> req.response().await());
+    }
+    HttpClientRequest req = client.request(new RequestOptions(requestOptions).setMethod(HttpMethod.POST)).await();
+    assertThatThrownBy(() -> req.putTrailer("foo", "bar\r\nhost: evil")).isInstanceOf(IllegalArgumentException.class);
+    assertThatThrownBy(() -> req.trailers().add("foo", "bar\r\nhost: evil")).isInstanceOf(IllegalArgumentException.class);
+    assertThatThrownBy(() -> req.putTrailer(":path", "/evil")).isInstanceOf(IllegalArgumentException.class);
+    assertThatThrownBy(() -> req.putTrailer("foo bar", "value")).isInstanceOf(IllegalArgumentException.class);
+    req.reset();
+  }
+
+  @Test
+  public void testConnectRequestTrailers() throws Exception {
+    server.requestHandler(req -> {});
+    startServer(testAddress);
+    HttpClientRequest req = client.request(new RequestOptions(requestOptions).setMethod(HttpMethod.CONNECT)).await();
+    assertThatThrownBy(req::trailers).isInstanceOf(IllegalStateException.class);
+    assertThatThrownBy(() -> req.putTrailer("foo", "foo_value")).isInstanceOf(IllegalStateException.class);
+    req.reset();
+  }
+
+  @Test
+  public void testUseAfterServerResponseHeadSent(Checkpoint checkpoint) throws Exception {
+    server.requestHandler(req -> {
+      HttpServerResponse resp = req.response();
+      resp.putHeader(HttpHeaders.CONTENT_LENGTH, "" + 128);
+      resp.write("01234567");
+      assertTrue(resp.headWritten());
+      assertIllegalStateException(() -> resp.setChunked(false));
+      assertIllegalStateException(() -> resp.setStatusCode(200));
+      assertIllegalStateException(() -> resp.setStatusMessage("OK"));
+      assertIllegalStateException(() -> resp.putHeader("foo", "bar"));
+      assertIllegalStateException(() -> resp.addCookie(Cookie.cookie("the_cookie", "wibble")));
+      assertIllegalStateException(() -> resp.removeCookie("the_cookie"));
+      checkpoint.succeed();
+    });
+    startServer(testAddress);
+    client
+      .request(requestOptions)
+      .compose(HttpClientRequest::send)
+      .await();
+  }
+
+  @Test
+  public void testUseAfterServerResponseSent(Checkpoint checkpoint) throws Exception {
+    server.requestHandler(req -> {
+      HttpServerResponse resp = req.response();
+      assertFalse(resp.ended());
+      resp.end();
+      assertTrue(resp.ended());
+      Buffer buff = Buffer.buffer();
+      assertIllegalStateException(() -> resp.drainHandler(v -> {}));
+      assertIllegalStateException(() -> resp.exceptionHandler(v -> {}));
+      assertIllegalStateException(() -> resp.setChunked(false));
+      assertIllegalStateException(() -> resp.setWriteQueueMaxSize(123));
+      assertIllegalStateException(() -> resp.writeQueueFull());
+      assertIllegalStateException(() -> resp.putHeader("foo", "bar"));
+      assertIllegalStateException(() -> resp.sendFile("a/a.txt"));
+      assertIllegalStateException(() -> resp.end());
+      assertIllegalStateException(() -> resp.end("foo"));
+      assertIllegalStateException(() -> resp.end(buff));
+      assertIllegalStateException(() -> resp.end("foo", "UTF-8"));
+      assertIllegalStateException(() -> resp.write(buff));
+      assertIllegalStateException(() -> resp.write("foo"));
+      assertIllegalStateException(() -> resp.write("foo", "UTF-8"));
+      assertIllegalStateException(() -> resp.write(buff));
+      assertIllegalStateException(() -> resp.sendFile("a/a.txt"));
+      assertIllegalStateException(() -> resp.end());
+      assertIllegalStateException(() -> resp.end("foo"));
+      assertIllegalStateException(() -> resp.end(buff));
+      assertIllegalStateException(() -> resp.end("foo", "UTF-8"));
+      assertIllegalStateException(() -> resp.write(buff));
+      assertIllegalStateException(() -> resp.write("foo"));
+      assertIllegalStateException(() -> resp.write("foo", "UTF-8"));
+      assertIllegalStateException(() -> resp.write(buff));
+      checkpoint.succeed();
+    });
+    startServer(testAddress);
+    client
+      .request(requestOptions)
+      .compose(HttpClientRequest::send)
+      .await();
+  }
+
+  @Test
+  public void testSetInvalidStatusMessage() throws Exception {
+    server.requestHandler(req -> {
+      try {
+        req.response().setStatusMessage("hello\nworld");
+        assertNotEquals(HttpVersion.HTTP_1_1, req.version());
+      } catch (IllegalArgumentException ignore) {
+        assertEquals(HttpVersion.HTTP_1_1, req.version());
+      }
+      req.response().end();
+    });
+    startServer(testAddress);
+    client.request(requestOptions)
+      .compose(req -> req.send()
+        .expecting(HttpResponseExpectation.SC_OK)
+        .compose(HttpClientResponse::end)
+      ).await();
+  }
+
+  @Test
+  public void testResponseBodyBufferAtEnd() throws Exception {
+    Buffer body = TestUtils.randomBuffer(1000);
+
+    server.requestHandler(req -> {
+      req.response().end(body);
+    });
+    startServer(testAddress);
+    client.request(requestOptions)
+      .compose(req -> req
+        .send()
+        .expecting(HttpResponseExpectation.SC_OK)
+        .compose(HttpClientResponse::body)
+        .expecting(that(buff -> assertEquals(body, buff))))
+      .await();
+  }
+
+  @Test
+  public void testResponseBodyWriteChunked() throws Exception {
+    testResponseBodyWrite(true);
+  }
+
+  @Test
+  public void testResponseBodyWriteNonChunked() throws Exception {
+    testResponseBodyWrite(false);
+  }
+
+  private void testResponseBodyWrite(boolean chunked) throws Exception {
+    Buffer body = Buffer.buffer();
+
+    int numWrites = 10;
+    int chunkSize = 100;
+
+    server.requestHandler(req -> {
+      assertFalse(req.response().headWritten());
+      if (chunked) {
+        req.response().setChunked(true);
+      } else {
+        req.response().headers().set("Content-Length", String.valueOf(numWrites * chunkSize));
+      }
+      assertFalse(req.response().headWritten());
+      for (int i = 0; i < numWrites; i++) {
+        Buffer b = TestUtils.randomBuffer(chunkSize);
+        body.appendBuffer(b);
+        req.response().write(b);
+        assertTrue(req.response().headWritten());
+      }
+      req.response().end();
+      assertTrue(req.response().headWritten());
+    });
+
+    startServer(testAddress);
+    client.request(requestOptions)
+      .compose(req -> req
+        .send()
+        .expecting(HttpResponseExpectation.SC_OK)
+        .compose(HttpClientResponse::body)
+        .expecting(that(buff -> assertEquals(body, buff))))
+      .await();
+  }
+
+  @Test
+  public void testResponseBodyWriteStringChunkedDefaultEncoding() throws Exception {
+    testResponseBodyWriteString(true, null);
+  }
+
+  @Test
+  public void testResponseBodyWriteStringChunkedUTF8() throws Exception {
+    testResponseBodyWriteString(true, "UTF-8");
+  }
+
+  @Test
+  public void testResponseBodyWriteStringChunkedUTF16() throws Exception {
+    testResponseBodyWriteString(true, "UTF-16");
+  }
+
+  @Test
+  public void testResponseBodyWriteStringNonChunkedDefaultEncoding() throws Exception {
+    testResponseBodyWriteString(false, null);
+  }
+
+  @Test
+  public void testResponseBodyWriteStringNonChunkedUTF8() throws Exception {
+    testResponseBodyWriteString(false, "UTF-8");
+  }
+
+  @Test
+  public void testResponseBodyWriteStringNonChunkedUTF16() throws Exception {
+    testResponseBodyWriteString(false, "UTF-16");
+  }
+
+  private void testResponseBodyWriteString(boolean chunked, String encoding) throws Exception {
+    String body = TestUtils.randomUnicodeString(1000);
+    Buffer bodyBuff;
+
+    if (encoding == null) {
+      bodyBuff = Buffer.buffer(body);
+    } else {
+      bodyBuff = Buffer.buffer(body, encoding);
+    }
+
+    server.requestHandler(req -> {
+      if (chunked) {
+        req.response().setChunked(true);
+      } else {
+        req.response().headers().set("Content-Length", String.valueOf(bodyBuff.length()));
+      }
+      if (encoding == null) {
+        req.response().write(body);
+      } else {
+        req.response().write(body, encoding);
+      }
+      req.response().end();
+    });
+
+    startServer(testAddress);
+    client.request(requestOptions)
+      .compose(req -> req
+        .send()
+        .expecting(HttpResponseExpectation.SC_OK)
+        .compose(HttpClientResponse::body)
+        .expecting(that(buff -> assertEquals(body, encoding == null ? buff.toString() : buff.toString(encoding)))))
+      .await();
+  }
+
+  @Test
+  public void testResponseWrite() throws Exception {
+    Buffer body = TestUtils.randomBuffer(1000);
+
+    server.requestHandler(req -> {
+      req.response().setChunked(true);
+      req.response().write(body);
+      req.response().end();
+    });
+
+    startServer(testAddress);
+    client.request(requestOptions)
+      .compose(req -> req
+        .send()
+        .expecting(HttpResponseExpectation.SC_OK)
+        .compose(HttpClientResponse::body)
+        .expecting(that(buff -> assertEquals(body, buff))))
+      .await();
+  }
+
+  @Test
+  public void test100ContinueHandledAutomatically(Checkpoint checkpoint) throws Exception {
+    Buffer toSend = TestUtils.randomBuffer(1000);
+
+    server = config.forServer().setHandle100ContinueAutomatically(true).create(vertx);
+
+    server.requestHandler(req -> {
+      req.bodyHandler(data -> {
+        assertEquals(toSend, data);
+        req.response().end();
+      });
+    });
+
+    startServer(testAddress);
+    client.request(new RequestOptions(requestOptions).setMethod(HttpMethod.PUT)).onComplete(TestUtils.onSuccess(req -> {
+      req
+        .response()
+        .compose(HttpClientResponse::end)
+        .onComplete(checkpoint);
+      req.headers().set("Expect", "100-continue");
+      req.setChunked(true);
+      req.continueHandler(v -> {
+        req.write(toSend);
+        req.end();
+      });
+      req.writeHead();
+    }));
+  }
+
+  @Test
+  public void test100ContinueHandledManually(Checkpoint checkpoint) throws Exception {
+
+    Buffer toSend = TestUtils.randomBuffer(1000);
+    server.requestHandler(req -> {
+      assertEquals("100-continue", req.getHeader("expect"));
+      req.response().writeContinue();
+      req.bodyHandler(data -> {
+        assertEquals(toSend, data);
+        req.response().end();
+      });
+    });
+
+    startServer(testAddress);
+    client.request(new RequestOptions(requestOptions).setMethod(HttpMethod.PUT)).onComplete(TestUtils.onSuccess(req -> {
+      req
+        .response()
+        .compose(HttpClientResponse::end)
+        .onComplete(checkpoint);
+      req.headers().set("Expect", "100-continue");
+      req.setChunked(true);
+      req.continueHandler(v -> {
+        req.write(toSend);
+        req.end();
+      });
+      req.writeHead();
+    }));
+  }
+
+  @Test
+  public void test100ContinueRejectedManually(Checkpoint checkpoint) throws Exception {
+
+    server.requestHandler(req -> {
+      req.response().setStatusCode(405).end();
+      req.bodyHandler(data -> {
+        Assert.fail("body should not be received");
+      });
+    });
+
+    startServer(testAddress);
+    client.request(new RequestOptions(requestOptions).setMethod(HttpMethod.PUT)).onComplete(TestUtils.onSuccess(req -> {
+      req
+        .response()
+        .expecting(HttpResponseExpectation.SC_METHOD_NOT_ALLOWED)
+        .compose(HttpClientResponse::end)
+        .onComplete(checkpoint);
+      req.headers().set("Expect", "100-continue");
+      req.setChunked(true);
+      req.continueHandler(v -> {
+        Assert.fail("should not be called");
+      });
+      req.writeHead();
+    }));
+  }
+
+  @Test
+  public void test100ContinueTimeout(Checkpoint checkpoint) throws Exception {
+    server.requestHandler(req -> {
+      req.response().writeContinue();
+    });
+
+    client = config.forClient().setIdleTimeout(Duration.ofSeconds(1)).create(vertx);
+
+    startServer(testAddress);
+    try {
+      client.request(new RequestOptions(requestOptions).setMethod(HttpMethod.PUT))
+        .compose(req -> req
+          .putHeader("Expect", "100-continue")
+          .continueHandler(v -> checkpoint.succeed())
+          .send()).await();
+      fail();
+    } catch (Exception expected) {
+    }
+  }
+
+  @Test
+  public void test103EarlyHints(Checkpoint checkpoint1, Checkpoint checkpoint2) throws Exception {
+
+    server.requestHandler(req -> {
+      HttpServerResponse resp = req.response();
+      req.pause();
+      resp.writeEarlyHints(Http1xHeaders.httpHeaders().add("wibble", "wibble-103-value"))
+        .onComplete(TestUtils.onSuccess(result -> {
+          req.resume();
+          resp.putHeader("wibble", "wibble-200-value");
+          req.bodyHandler(body -> {
+            assertEquals("request-body", body.toString());
+            resp.end("response-body");
+          });
+      }));
+    });
+
+    AtomicBoolean earlyHintsHandled = new AtomicBoolean();
+
+    startServer(testAddress);
+    client.request(new RequestOptions(requestOptions).setMethod(HttpMethod.PUT))
+      .onComplete(TestUtils.onSuccess(req -> {
+        req
+          .earlyHintsHandler(earlyHintsHeaders -> {
+            assertEquals("wibble-103-value", earlyHintsHeaders.get("wibble"));
+            earlyHintsHandled.set(true);
+          })
+          .send("request-body")
+          .onComplete(TestUtils.onSuccess(resp -> {
+            assertEquals(200, resp.statusCode());
+            assertEquals("wibble-200-value", resp.headers().get("wibble"));
+            resp.endHandler(v -> {
+              assertTrue("Early hints handle check", earlyHintsHandled.get());
+              checkpoint1.succeed();
+            });
+            resp.bodyHandler(body -> {
+              assertEquals(body, Buffer.buffer("response-body"));
+              checkpoint2.succeed();
+            });
+          }));
+      }));
+  }
+
+  @Test
+  public void testClientDrainHandler(Checkpoint checkpoint) throws Exception {
+    pausingServer(resumeFuture -> {
+      client.request(requestOptions).onComplete(TestUtils.onSuccess(req -> {
+        req.setChunked(true);
+        assertFalse(req.writeQueueFull());
+        req.setWriteQueueMaxSize(1000);
+        Buffer buff = TestUtils.randomBuffer(10000);
+        vertx.setPeriodic(1, id -> {
+          req.write(buff);
+          if (req.writeQueueFull()) {
+            vertx.cancelTimer(id);
+            req.drainHandler(v -> {
+              assertFalse(req.writeQueueFull());
+              checkpoint.succeed();
+            });
+
+            // Tell the server to resume
+            resumeFuture.complete();
+          }
+        });
+      }));
+    });
+  }
+
+  private void pausingServer(Consumer<Promise<Void>> consumer) throws Exception {
+    Promise<Void> resumeFuture = Promise.promise();
+    server.requestHandler(req -> {
+      req.response().setChunked(true);
+      req.pause();
+      Context ctx = vertx.getOrCreateContext();
+      resumeFuture.future().onComplete(v1 -> {
+        ctx.runOnContext(v2 -> {
+          req.resume();
+        });
+      });
+      req.handler(buff -> {
+        req.response().write(buff);
+      });
+    });
+
+    startServer(testAddress);
+    consumer.accept(resumeFuture);
+  }
+
+  @Test
+  public void testHttpServerResponseFlowControl(Checkpoint checkpoint) throws Exception {
+
+    Promise<Void> promise = Promise.promise();
+
+    server.requestHandler(request -> {
+      request.pause();
+      request.endHandler(v -> {
+        checkpoint.succeed();
+      });
+      promise.future().onSuccess(v -> {
+        request.resume();
+      });
+    });
+
+    startServer();
+
+    Buffer chunk = Buffer.buffer(TestUtils.randomAlphaString(1024));
+
+    client.request(new RequestOptions(requestOptions).setMethod(PUT)).onComplete(TestUtils.onSuccess(request -> {
+      exhaustControlFlowWindow(request, chunk, v -> {
+        promise.succeed();
+        request.end();
+      });
+    }));
+  }
+
+  private void exhaustControlFlowWindow(WriteStream<Buffer> stream, Buffer chunk, Handler<Void> done) {
+    int numWrites = 0;
+    while (!stream.writeQueueFull()) {
+      stream.write(chunk);
+      numWrites++;
+    }
+    if (numWrites > 0) {
+      vertx.setTimer(5, id -> {
+        exhaustControlFlowWindow(stream, chunk, done);
+      });
+    } else {
+      done.handle(null);
+    }
+  }
+
+  @Test
+  public void testServerDrainHandler(Checkpoint checkpoint) throws Exception {
+    drainingServer(checkpoint, resumeFuture -> {
+      client.request(requestOptions)
+        .compose(HttpClientRequest::send)
+        .onComplete(TestUtils.onSuccess(resp -> {
+        resp.pause();
+        resumeFuture.onComplete(ar -> resp.resume());
+      }));
+    });
+  }
+
+  private void drainingServer(Checkpoint checkpoint, Consumer<Future<Void>> consumer) throws Exception {
+
+    Promise<Void> resumeFuture = Promise.promise();
+
+    server.requestHandler(req -> {
+      req.response().setChunked(true);
+      assertFalse(req.response().writeQueueFull());
+      req.response().setWriteQueueMaxSize(1000);
+
+      Buffer buff = TestUtils.randomBuffer(10000);
+      //Send data until the buffer is full
+      vertx.setPeriodic(1, id -> {
+        req.response().write(buff);
+        if (req.response().writeQueueFull()) {
+          vertx.cancelTimer(id);
+          req.response().drainHandler(v -> {
+            assertFalse(req.response().writeQueueFull());
+            checkpoint.succeed();
+          });
+
+          // Tell the client to resume
+          resumeFuture.complete();
+        }
+      });
+    });
+
+    startServer(testAddress);
+    consumer.accept(resumeFuture.future());
+  }
+
+  @Test
+  public void testConnectInvalidPort() {
+    client = config.forClient().setConnectTimeout(Duration.ofMillis(300)).create(vertx);
+    assertThatThrownBy(() -> {
+      client.request(HttpMethod.GET, 9998, config.host(), DEFAULT_TEST_URI).await();
+    });
+  }
+
+  @Test
+  public void testConnectInvalidHost() {
+    client = config.forClient().setConnectTimeout(Duration.ofMillis(300)).create(vertx);
+    assertThatThrownBy(() -> {
+      client.request(HttpMethod.GET, 9998, "255.255.255.255", DEFAULT_TEST_URI).await();
+    });
+  }
+
+  @Test
+  public void testSetHandlersAfterListening() throws Exception {
+    server.requestHandler(v -> {});
+
+    startServer(testAddress);
+
+    assertThatThrownBy(() -> server.requestHandler(v -> {})).isInstanceOf(IllegalStateException.class);
+    assertThatThrownBy(() -> server.webSocketHandler(v -> {})).isInstanceOf(IllegalStateException.class);
+  }
+
+  @Test
+  public void testListenNoHandlers() {
+    assertIllegalStateException(() -> server.listen().await());
+  }
+
+  @Test
+  public void testListenTwice() throws Exception {
+    server.requestHandler(v -> {});
+    startServer(testAddress);
+    assertIllegalStateException(() -> server.listen().await());
+  }
+
+  @Test
+  public void testSetChunked() throws Exception {
+    server.requestHandler(req -> {
+      HttpServerResponse resp = req.response();
+      assertFalse(resp.isChunked());
+      resp.setChunked(true);
+      assertTrue(resp.isChunked());
+      resp.setChunked(false);
+      assertFalse(resp.isChunked());
+      resp.end();
+    });
+    startServer(testAddress);
+    client.request(requestOptions)
+      .compose(req -> req
+        .send()
+        .expecting(HttpResponseExpectation.SC_OK)
+        .compose(HttpClientResponse::end))
+      .await(20, TimeUnit.SECONDS);
+  }
+
+  @Test
+  public void testRemoteAddress() throws Exception {
+    server.requestHandler(req -> {
+      if (testAddress.isInetSocket()) {
+        assertEquals("127.0.0.1", req.remoteAddress().host());
+      } else {
+        // Returns null for domain sockets
+      }
+      req.response().end();
+    });
+
+    startServer(testAddress);
+    client.request(requestOptions)
+      .compose(req -> req
+        .send()
+        .expecting(HttpResponseExpectation.SC_OK)
+        .compose(HttpClientResponse::end))
+      .await();
+  }
+
+  @Test
+  public void testGetAbsoluteURI() throws Exception {
+    server.requestHandler(req -> {
+      assertEquals(req.scheme() + "://" + config.host() + ":" + config.port() + "/foo/bar", req.absoluteURI());
+      req.response().end();
+    });
+
+    startServer(testAddress);
+    client.request(new RequestOptions(requestOptions).setURI("/foo/bar"))
+      .compose(req -> req
+        .send()
+        .compose(HttpClientResponse::end))
+      .await();
+  }
+
+  @Test
+  public void testGetAbsoluteURIWithParam() throws Exception {
+    server.requestHandler(req -> {
+      assertEquals(req.scheme() + "://" + config.host() + ":" + config.port() + "/foo/bar?a=1", req.absoluteURI());
+      req.response().end();
+    });
+
+    startServer(testAddress);
+    client.request(new RequestOptions(requestOptions).setURI("/foo/bar?a=1"))
+      .compose(req -> req
+        .send()
+        .compose(HttpClientResponse::end))
+      .await();
+  }
+
+  @Test
+  public void testGetAbsoluteURIWithUnsafeParam() throws Exception {
+    server.requestHandler(req -> {
+      assertEquals(req.scheme() + "://" + config.host() + ":" + config.port() + "/foo/bar?a={1}", req.absoluteURI());
+      req.response().end();
+    });
+
+    startServer(testAddress);
+    client.request(new RequestOptions(requestOptions).setURI("/foo/bar?a={1}"))
+      .compose(req -> req
+        .send()
+        .compose(HttpClientResponse::end))
+      .await();
+  }
+
+  @Test
+  public void testGetAbsoluteURIWithOptionsServerLevel() throws Exception {
+    server.requestHandler(req -> {
+      assertEquals(OPTIONS, req.method());
+      assertNull(req.absoluteURI());
+      req.response().end();
+    });
+
+    startServer(testAddress);
+    client.request(new RequestOptions(requestOptions).setURI("*").setMethod(OPTIONS))
+      .compose(req -> req
+        .send()
+        .compose(HttpClientResponse::end))
+      .await();
+  }
+
+  @Test
+  public void testGetAbsoluteURIWithAbsoluteRequestUri() throws Exception {
+    server.requestHandler(req -> {
+      assertEquals("http://www.w3.org/pub/WWW/TheProject.html", req.absoluteURI());
+      req.response().end();
+    });
+
+    startServer(testAddress);
+    client.request(new RequestOptions(requestOptions).setURI("http://www.w3.org/pub/WWW/TheProject.html"))
+      .compose(req -> req
+        .send()
+        .compose(HttpClientResponse::end))
+      .await();
+  }
+
+  @Test
+  public void testListenInvalidPort() throws Exception {
+    ServerSocket occupied = null;
+    try{
+      /* Ask to be given a usable port, then use it exclusively so Vert.x can't use the port number */
+      occupied = new ServerSocket(0);
+      occupied.setReuseAddress(false);
+      server = createHttpServer(new HttpServerOptions().setPort(occupied.getLocalPort()));
+      assertThatThrownBy(() -> {
+        server.requestHandler(v -> {}).listen().await();
+      });
+    } finally {
+      if( occupied != null ) {
+        occupied.close();
+      }
+    }
+  }
+
+  @Test
+  public void testListenInvalidHost() {
+    server = createHttpServer(new HttpServerOptions().setPort(config.port()).setHost("iqwjdoqiwjdoiqwdiojwd"));
+    server.requestHandler(v -> {});
+    assertThatThrownBy(() -> server.listen().await());
+  }
+
+  @Test
+  public void testPauseResumeClientResponseWontCallEndHandlePrematurely(Checkpoint checkpoint) throws Exception {
+    Buffer expected = Buffer.buffer(TestUtils.randomAlphaString(8192));
+    server.requestHandler(req -> {
+      req.response().end(expected);
+    });
+    startServer(testAddress);
+    client.request(requestOptions).onComplete(TestUtils.onSuccess(req -> {
+      req.send().onComplete(TestUtils.onSuccess(resp -> {
+        resp.bodyHandler(body -> {
+          assertEquals(expected, body);
+          checkpoint.succeed();
+        });
+        // Check that pause resume won't call the end handler prematurely
+        resp.pause();
+        resp.resume();
+      }));
+    }));
+  }
+
+  @Test
+  public void testPauseClientResponse(Checkpoint checkpoint) throws Exception {
+    int numWrites = 10;
+    int numBytes = 100;
+    server.requestHandler(req -> {
+      req.response().setChunked(true);
+      // Send back a big response in several chunks
+      for (int i = 0; i < numWrites; i++) {
+        req.response().write(TestUtils.randomBuffer(numBytes));
+      }
+      req.response().end();
+    });
+
+    startServer(testAddress);
+
+    AtomicBoolean paused = new AtomicBoolean();
+    Buffer totBuff = Buffer.buffer();
+    client.request(requestOptions).onComplete(TestUtils.onSuccess(req -> {
+      req.send().onComplete(TestUtils.onSuccess(resp -> {
+        resp.pause();
+        paused.set(true);
+        resp.handler(chunk -> {
+          if (paused.get()) {
+            Assert.fail("Shouldn't receive chunks when paused");
+          } else {
+            totBuff.appendBuffer(chunk);
+          }
+        });
+        resp.endHandler(v -> {
+          if (paused.get()) {
+            Assert.fail("Shouldn't receive chunks when paused");
+          } else {
+            assertEquals(numWrites * numBytes, totBuff.length());
+            checkpoint.succeed();
+          }
+        });
+        vertx.setTimer(500, id -> {
+          paused.set(false);
+          resp.resume();
+        });
+      }));
+    }));
+  }
+
+  @Test
+  public void testDeliverPausedBufferWhenResume(Checkpoint checkpoint) throws Exception {
+    testDeliverPausedBufferWhenResume(checkpoint, block -> vertx.setTimer(10, id -> block.run()));
+  }
+
+  @Test
+  public void testDeliverPausedBufferWhenResumeOnOtherThread(Checkpoint checkpoint) throws Exception {
+    ExecutorService exec = Executors.newSingleThreadExecutor();
+    try {
+      testDeliverPausedBufferWhenResume(checkpoint, block -> exec.execute(() -> {
+        try {
+          Thread.sleep(10);
+        } catch (InterruptedException e) {
+          Assert.fail(e.getMessage());
+          Thread.currentThread().interrupt();
+        }
+        block.run();
+      }));
+    } finally {
+      exec.shutdown();
+    }
+  }
+
+  private void testDeliverPausedBufferWhenResume(Checkpoint checkpoint, Consumer<Runnable> scheduler) throws Exception {
+    Buffer data = TestUtils.randomBuffer(2048);
+    int num = 10;
+    CountDownLatch latch = checkpoint.asLatch(num);
+    List<CompletableFuture<Void>> resumes = Collections.synchronizedList(new ArrayList<>());
+    for (int i = 0;i < num;i++) {
+      resumes.add(new CompletableFuture<>());
+    }
+    server.requestHandler(req -> {
+      int idx = Integer.parseInt(req.path().substring(1));
+      HttpServerResponse resp = req.response();
+      resumes.get(idx).thenAccept(v -> {
+        resp.end();
+      });
+      resp.setChunked(true).write(data);
+    });
+    startServer(testAddress);
+    client = config.forClient().create(vertx, new PoolOptions().setHttp1MaxSize(1));
+    for (int i = 0;i < num;i++) {
+      int idx = i;
+      client.request(new RequestOptions(requestOptions).setURI("/" + i)).onComplete(TestUtils.onSuccess(req -> {
+        req.send().onComplete(TestUtils.onSuccess(resp -> {
+          Buffer body = Buffer.buffer();
+          Thread t = Thread.currentThread();
+          resp.handler(buff -> {
+            assertSame(t, Thread.currentThread());
+            resumes.get(idx).complete(null);
+            body.appendBuffer(buff);
+          });
+          resp.endHandler(v -> {
+            // assertEquals(data, body);
+            latch.countDown();
+          });
+          resp.pause();
+          scheduler.accept(resp::resume);
+        }));
+      }));
+    }
+    checkpoint.awaitSuccess();
+  }
+
+  @Test
+  public void testClearPausedBuffersWhenResponseEnds() throws Exception {
+    Buffer data = Buffer.buffer(TestUtils.randomAlphaString(20));
+    int num = 10;
+    server.requestHandler(req -> {
+      req.response().end(data);
+    });
+    startServer(testAddress);
+    client = config.forClient().create(vertx, new PoolOptions().setHttp1MaxSize(1));
+    for (int i = 0;i < num;i++) {
+      client.request(requestOptions)
+        .compose(req -> req
+          .send()
+          .expecting(HttpResponseExpectation.SC_OK)
+          .compose(resp -> Future.future(promise -> {
+            resp.bodyHandler(buff -> {
+              assertEquals(data, buff);
+              promise.complete();
+            });
+            resp.pause();
+            vertx.setTimer(10, id -> {
+              resp.resume();
+            });
+          }))).await();
+    }
+  }
+
+  @Test
+  public void testPausedHttpServerRequest(Checkpoint checkpoint) throws Exception {
+    CompletableFuture<Void> resumeCF = new CompletableFuture<>();
+    Buffer expected = Buffer.buffer();
+    server.requestHandler(req -> {
+      req.pause();
+      AtomicBoolean paused = new AtomicBoolean(true);
+      Buffer body = Buffer.buffer();
+      req.handler(buff -> {
+        assertFalse(paused.get());
+        body.appendBuffer(buff);
+      });
+      resumeCF.thenAccept(v -> {
+        paused.set(false);
+        req.resume();
+      });
+      req.endHandler(v -> {
+        assertEquals(expected, body);
+        req.response().end();
+      });
+    });
+    startServer(testAddress);
+    client.request(new RequestOptions(requestOptions).setMethod(HttpMethod.PUT))
+      .onComplete(TestUtils.onSuccess(req -> {
+        req
+          .setChunked(true)
+          .response().onComplete(TestUtils.onSuccess(resp -> {
+            resp.endHandler(v -> checkpoint.succeed());
+          }));
+        while (!req.writeQueueFull()) {
+          Buffer buff = Buffer.buffer(TestUtils.randomAlphaString(1024));
+          expected.appendBuffer(buff);
+          req.write(buff);
+        }
+        resumeCF.complete(null);
+        req.end();
+    }));
+  }
+
+  @Test
+  public void testHttpServerRequestPausedDuringLastChunk1() throws Exception {
+    testHttpServerRequestPausedDuringLastChunk(false);
+  }
+
+  @Test
+  public void testHttpServerRequestPausedDuringLastChunk2() throws Exception {
+    testHttpServerRequestPausedDuringLastChunk(true);
+  }
+
+  private void testHttpServerRequestPausedDuringLastChunk(boolean fetching) throws Exception {
+    server.requestHandler(req -> {
+      AtomicBoolean ended = new AtomicBoolean();
+      AtomicBoolean paused = new AtomicBoolean();
+      req.handler(buff -> {
+        assertEquals("small", buff.toString());
+        req.pause();
+        paused.set(true);
+        vertx.setTimer(20, id -> {
+          assertFalse(ended.get());
+          paused.set(false);
+          if (fetching) {
+            req.fetch(1);
+          } else {
+            req.resume();
+          }
+        });
+      });
+      req.endHandler(v -> {
+        assertFalse(paused.get());
+        ended.set(true);
+        req.response().end();
+      });
+    });
+    startServer(testAddress);
+    client = createHttpClient(new PoolOptions().setHttp1MaxSize(1));
+    client.request(new RequestOptions(requestOptions).setMethod(HttpMethod.PUT))
+      .compose(req -> req
+        .send(Buffer.buffer("small"))
+        .compose(HttpClientResponse::end))
+      .await();
+  }
+
+  @Test
+  public void testHttpClientResponsePausedDuringLastChunk1(Checkpoint checkpoint) throws Exception {
+    testHttpClientResponsePausedDuringLastChunk(checkpoint, false);
+  }
+
+  @Test
+  public void testHttpClientResponsePausedDuringLastChunk2(Checkpoint checkpoint) throws Exception {
+    testHttpClientResponsePausedDuringLastChunk(checkpoint, true);
+  }
+
+  private void testHttpClientResponsePausedDuringLastChunk(Checkpoint checkpoint, boolean fetching) throws Exception {
+    server.requestHandler(req -> {
+      req.response().end("small");
+    });
+    startServer(testAddress);
+    client = createHttpClient(new PoolOptions().setHttp1MaxSize(1));
+    client.request(requestOptions).onComplete(TestUtils.onSuccess(req -> {
+      req.send().onComplete(TestUtils.onSuccess(resp -> {
+        AtomicBoolean ended = new AtomicBoolean();
+        AtomicBoolean paused = new AtomicBoolean();
+        resp.handler(buff -> {
+          assertEquals("small", buff.toString());
+          resp.pause();
+          paused.set(true);
+          vertx.setTimer(20, id -> {
+            assertFalse(ended.get());
+            paused.set(false);
+            if (fetching) {
+              resp.fetch(1);
+            } else {
+              resp.resume();
+            }
+          });
+        });
+        resp.endHandler(v -> {
+          assertFalse(paused.get());
+          ended.set(true);
+          checkpoint.succeed();
+        });
+      }));
+    }));
+  }
+
+  @Test
+  public void testHostHeaderOverridePossible() throws Exception {
+    server.requestHandler(req -> {
+      assertEquals("localhost", req.authority().host());
+      assertEquals(4444, req.authority().port());
+      req.response().end();
+    });
+
+    startServer(testAddress);
+    client.request(new RequestOptions().setServer(testAddress).setHost("localhost").setPort(4444))
+      .compose(req -> req
+        .send()
+        .compose(HttpClientResponse::end))
+      .await();
+  }
+
+  @Test
+  public void testResponseBodyWriteFixedString() throws Exception {
+    String body = "Lorem ipsum dolor sit amet, consectetur adipisicing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.";
+    Buffer bodyBuff = Buffer.buffer(body);
+
+    server.requestHandler(req -> {
+      req.response().setChunked(true);
+      req.response().write(body);
+      req.response().end();
+    });
+
+    startServer(testAddress);
+    Buffer responseBody = client.request(requestOptions).compose(req -> req
+        .send()
+        .expecting(HttpResponseExpectation.SC_OK)
+        .compose(HttpClientResponse::body))
+      .await();
+    assertEquals(bodyBuff, responseBody);
+  }
+
+  @Test
+  public void testClientMultiThreaded() throws Exception {
+    int numThreads = 10;
+    Thread[] threads = new Thread[numThreads];
+    CountDownLatch latch = new CountDownLatch(numThreads);
+    server.requestHandler(req -> {
+      req.response().putHeader("count", req.headers().get("count"));
+      req.response().end();
+    });
+    startServer(testAddress);
+    for (int i = 0; i < numThreads; i++) {
+      int index = i;
+      threads[i] = new Thread() {
+        public void run() {
+          client.request(requestOptions)
+            .compose(req -> req.putHeader("count", String.valueOf(index)).send())
+            .onComplete(TestUtils.onSuccess(resp -> {
+              assertEquals(200, resp.statusCode());
+              assertEquals(String.valueOf(index), resp.headers().get("count"));
+              latch.countDown();
+            }));
+        }
+      };
+      threads[i].start();
+    }
+    TestUtils.awaitLatch(latch);
+    for (int i = 0; i < numThreads; i++) {
+      threads[i].join();
+    }
+  }
+
+  @Test
+  public void testWorkerServer() throws Exception {
+    int numReq = 5; // 5 == the HTTP/1 pool max size
+    AtomicBoolean owner = new AtomicBoolean();
+    CountDownLatch latch = new CountDownLatch(1);
+    AtomicInteger connCount = new AtomicInteger();
+    vertx.deployVerticle(() -> new VerticleBase() {
+      @Override
+      public Future<?> start() {
+        return createHttpServer()
+          .requestHandler(req -> {
+            Context current = Vertx.currentContext();
+            assertTrue(current.isWorkerContext());
+            TestUtils.assertSameEventLoop(context, current);
+            try {
+              assertTrue(owner.compareAndSet(false, true));
+              Thread.sleep(200);
+            } catch (Exception e) {
+              Assert.fail(e.getMessage());
+            } finally {
+              owner.set(false);
+            }
+            req.response().end("pong");
+          }).connectionHandler(conn -> {
+          Context current = Vertx.currentContext();
+          // Not great but works for now
+          if (server instanceof TcpHttpServer) {
+            assertTrue(Context.isOnEventLoopThread());
+            assertTrue(current.isEventLoopContext());
+            assertNotSame(context, current);
+          }
+          connCount.incrementAndGet(); // No complete here as we may have 1 or 5 connections depending on the protocol
+        }).listen(testAddress);
+      }
+    }, new DeploymentOptions().setThreadingModel(ThreadingModel.WORKER))
+      .onComplete(TestUtils.onSuccess(id -> latch.countDown()));
+    TestUtils.awaitLatch(latch);
+    for (int i = 0;i < numReq;i++) {
+      client.request(requestOptions)
+        .compose(resp -> resp
+          .send()
+          .compose(HttpClientResponse::end))
+        .await();
+    }
+    assertTrue(connCount.get() > 0);
+  }
+
+  @Test
+  public void testClientReadStreamInWorker(Checkpoint checkpoint) throws Exception {
+    int numReq = 16;
+    CountDownLatch latch = checkpoint.asLatch(numReq);
+    Buffer body = Buffer.buffer(randomAlphaString(512 * 1024));
+    vertx.deployVerticle(new VerticleBase() {
+        @Override
+        public Future<?> start() {
+          HttpServer server = createHttpServer();
+          server.requestHandler(req -> {
+            req.response().end(body);
+          });
+          return server.listen(testAddress);
+        }
+      })
+      .await(20, TimeUnit.SECONDS);
+    vertx.deployVerticle(new VerticleBase() {
+      HttpClient client;
+      @Override
+      public Future<?> start() throws Exception {
+        client = createHttpClient(new PoolOptions().setHttp1MaxSize(1));
+        for (int i = 0; i < numReq; i++) {
+          client.request(requestOptions)
+            .compose(req -> req
+              .send()
+              .compose(resp -> {
+                resp.pause();
+                vertx.setTimer(250, id -> {
+                  resp.resume();
+                });
+                return resp.end();
+              }))
+            .onComplete(TestUtils.onSuccess(v -> latch.countDown()));
+        }
+        return super.start();
+      }
+    }, new DeploymentOptions().setThreadingModel(ThreadingModel.WORKER));
+  }
+
+  @Test
+  public void testServerReadStreamInWorker(Checkpoint checkpoint) throws Exception {
+    int numReq = 1;
+    CountDownLatch latch = checkpoint.asLatch(numReq);
+    Buffer body = Buffer.buffer(randomAlphaString(512 * 1024));
+    vertx.deployVerticle(new VerticleBase() {
+        @Override
+        public Future<?> start() throws Exception {
+          HttpServer server = createHttpServer();
+          server.requestHandler(req -> {
+            req.end().onComplete(onSuccess(v -> {
+              req.response().end();
+            }));
+            req.pause();
+            vertx.setTimer(10, id -> {
+              req.resume();
+            });
+          });
+          return server.listen(testAddress);
+        }
+    }, new DeploymentOptions().setThreadingModel(ThreadingModel.WORKER))
+      .await(20, TimeUnit.SECONDS);
+    vertx.deployVerticle(new VerticleBase() {
+      HttpClient client;
+      @Override
+      public Future<?> start() throws Exception {
+        client = createHttpClient(new PoolOptions().setHttp1MaxSize(1));
+        for (int i = 0; i < numReq; i++) {
+          client.request(requestOptions).
+            compose(req -> req
+              .send(body)
+              .compose(HttpClientResponse::end))
+            .onComplete(TestUtils.onSuccess(v -> latch.countDown()));
+        }
+        return super.start();
+      }
+      @Override
+      public Future<?> stop() {
+        return client.close();
+      }
+    });
+  }
+
+  @Test
+  public void testMultipleServerClose(Checkpoint checkpoint) {
+    this.server = createHttpServer();
+    // We assume the endHandler and the close completion handler are invoked in the same context task
+    ThreadLocal stack = new ThreadLocal();
+    stack.set(true);
+    server.close().onComplete(ar1 -> {
+      assertNull(stack.get());
+      assertTrue(Vertx.currentContext().isEventLoopContext());
+      server.close().onComplete(ar2 -> {
+        server.close().onComplete(ar3 -> {
+          checkpoint.succeed();
+        });
+      });
+    });
+  }
+
+  @Test
+  public void testRequestEnded() throws Exception {
+    server.requestHandler(req -> {
+      assertFalse(req.isEnded());
+      req.endHandler(v -> {
+        assertTrue(req.isEnded());
+        try  {
+          req.endHandler(v2 -> {});
+          Assert.fail("Shouldn't be able to set end handler");
+        } catch (IllegalStateException e) {
+          // OK
+        }
+        try  {
+          req.setExpectMultipart(true);
+          Assert.fail("Shouldn't be able to set expect multipart");
+        } catch (IllegalStateException e) {
+          // OK
+        }
+        try  {
+          req.bodyHandler(v2 -> {
+          });
+          Assert.fail("Shouldn't be able to set body handler");
+        } catch (IllegalStateException e) {
+          // OK
+        }
+        try  {
+          req.handler(v2 -> {
+          });
+          Assert.fail("Shouldn't be able to set handler");
+        } catch (IllegalStateException e) {
+          // OK
+        }
+
+        req.response().setStatusCode(200).end();
+      });
+    });
+    startServer(testAddress);
+    Integer sc = client.request(requestOptions)
+      .compose(req -> req
+        .send()
+        .map(HttpResponseHead::statusCode))
+      .await();
+    assertEquals(200, (int) sc);
+  }
+
+  @Test
+  public void testRequestEndedNoEndHandler(Checkpoint checkpoint) throws Exception {
+    server.requestHandler(req -> {
+      assertFalse(req.isEnded());
+      req.response().setStatusCode(200).end();
+      vertx.setTimer(500, v -> {
+        assertTrue(req.isEnded());
+        try {
+          req.endHandler(v2 -> {
+          });
+          Assert.fail("Shouldn't be able to set end handler");
+        } catch (IllegalStateException e) {
+          // OK
+        }
+        try {
+          req.setExpectMultipart(true);
+          Assert.fail("Shouldn't be able to set expect multipart");
+        } catch (IllegalStateException e) {
+          // OK
+        }
+        try {
+          req.bodyHandler(v2 -> {
+          });
+          Assert.fail("Shouldn't be able to set body handler");
+        } catch (IllegalStateException e) {
+          // OK
+        }
+        try {
+          req.handler(v2 -> {
+          });
+          Assert.fail("Shouldn't be able to set handler");
+        } catch (IllegalStateException e) {
+          // OK
+        }
+        checkpoint.succeed();
+      });
+    });
+    startServer(testAddress);
+    client.request(requestOptions)
+      .compose(HttpClientRequest::send)
+      .expecting(HttpResponseExpectation.SC_OK)
+      .await();
+  }
+
+  @Test
+  public void testAbsoluteURIServer() throws Exception {
+    server.requestHandler(req -> {
+      String absURI = req.absoluteURI();
+      assertEquals(req.scheme() + "://" + config.host() + ":" + config.port() + "/path", absURI);
+      req.response().end();
+    });
+    startServer(testAddress);
+    String path = "/path";
+    client.request(new RequestOptions(requestOptions).setURI(path))
+      .compose(HttpClientRequest::send)
+      .expecting(HttpResponseExpectation.SC_OK)
+      .await();
+  }
+
+  @Test
+  public void testDumpManyRequestsOnQueue(Checkpoint checkpoint) throws Exception {
+    int sendRequests = 10000;
+    AtomicInteger receivedRequests = new AtomicInteger();
+    client = config.forClient().create(vertx);
+    server.requestHandler(r-> {
+      r.response().end();
+      if (receivedRequests.incrementAndGet() == sendRequests) {
+        checkpoint.succeed();
+      }
+    });
+    startServer(testAddress);
+    IntStream.range(0, sendRequests)
+      .forEach(x -> client.request(requestOptions).compose(HttpClientRequest::send));
+  }
+
+  @Test
+  public void testOtherMethodRequest() throws Exception {
+    server.requestHandler(r -> {
+      assertEquals("COPY", r.method().name());
+      r.response().end();
+    });
+    startServer(testAddress);
+    client.request(new RequestOptions(requestOptions).setMethod(HttpMethod.valueOf("COPY")))
+      .compose(HttpClientRequest::send)
+      .expecting(HttpResponseExpectation.SC_OK)
+      .await();
+  }
+
+  @Test
+  public void testClientGlobalConnectionHandler(Checkpoint checkpoint) throws Exception {
+    server.requestHandler(req -> {
+      req.response().end();
+    });
+    startServer(testAddress);
+    ContextInternal ctx = (ContextInternal) vertx.getOrCreateContext();
+    client = httpClientBuilder()
+      .withConnectHandler(conn -> {
+        assertSame(ctx.nettyEventLoop(), ((ContextInternal)Vertx.currentContext()).nettyEventLoop());
+        checkpoint.succeed();
+      })
+      .build();
+    client.request(requestOptions)
+      .compose(HttpClientRequest::send)
+      .expecting(HttpResponseExpectation.SC_OK)
+      .await();
+  }
+
+  @Test
+  public void testServerConnectionHandler() throws Exception {
+    AtomicInteger status = new AtomicInteger();
+    AtomicReference<HttpConnection> connRef = new AtomicReference<>();
+    Context serverCtx = vertx.getOrCreateContext();
+    server.connectionHandler(conn -> {
+      TestUtils.assertSameEventLoop(serverCtx, Vertx.currentContext());
+      assertEquals(0, status.getAndIncrement());
+      assertNull(connRef.getAndSet(conn));
+    });
+    server.requestHandler(req -> {
+      assertEquals(1, status.getAndIncrement());
+      assertSame(connRef.get(), req.connection());
+      req.response().end();
+    });
+    startServer(testAddress, serverCtx, server);
+    client.request(requestOptions)
+      .compose(HttpClientRequest::send)
+      .expecting(HttpResponseExpectation.SC_OK)
+      .await();
+  }
+
+  @Test
+  public void testServerConnectionHandlerClose(Checkpoint checkpoint1, Checkpoint checkpoint2) throws Exception {
+    Context serverCtx = vertx.getOrCreateContext();
+    server.connectionHandler(conn -> {
+      conn.close();
+      conn.closeHandler(v -> checkpoint1.succeed());
+    });
+    server.requestHandler(req -> {
+    });
+    startServer(testAddress, serverCtx, server);
+    client = httpClientBuilder()
+      .withConnectHandler(conn -> {
+        conn.closeHandler(v -> {
+          checkpoint2.succeed();
+        });
+      })
+      .build();
+    client
+      .request(requestOptions)
+      .compose(HttpClientRequest::writeHead)
+      .await();
+  }
+
+  @Test
+  public void testClientConnectionClose(Checkpoint checkpoint) throws Exception {
+    // Test client connection close + server close handler
+    Promise<Void> latch = Promise.promise();
+    server.requestHandler(req -> {
+      AtomicInteger len = new AtomicInteger();
+      req.handler(buff -> {
+        if (len.addAndGet(buff.length()) == 1024) {
+          latch.complete();
+        }
+      });
+      req
+        .connection()
+        .closeHandler(v -> checkpoint.succeed());
+    });
+    startServer(testAddress);
+    client.request(new RequestOptions(requestOptions).setMethod(HttpMethod.POST)).onComplete(TestUtils.onSuccess(req -> {
+      req
+        .setChunked(true)
+        .write(TestUtils.randomBuffer(1024));
+      latch.future().onComplete(TestUtils.onSuccess(v -> {
+        req.connection().close();
+      }));
+    }));
+  }
+
+  @Test
+  public void testServerConnectionClose(Checkpoint checkpoint) throws Exception {
+    // Test server connection close + client close handler
+    server.requestHandler(req -> {
+      req.connection().close();
+    });
+    startServer(testAddress);
+    client = httpClientBuilder()
+      .withConnectHandler(conn -> {
+        conn.closeHandler(v -> {
+          checkpoint.succeed();
+        });
+      })
+      .build();
+    assertThatThrownBy(() -> {
+      client.request(requestOptions)
+        .compose(HttpClientRequest::send)
+        .await();
+    });
+  }
+
+  @Test
+  public void testClientLocalAddress() throws Exception {
+    String expectedAddress = TestUtils.loopbackAddress();
+    client = config.forClient().setLocalAddress(expectedAddress).create(vertx);
+    server.requestHandler(req -> {
+      assertEquals(expectedAddress, req.remoteAddress().host());
+      req.response().end();
+    });
+    startServer(testAddress);
+    Integer sc = client.request(GET, config.port(), config.host(), "/somepath")
+      .compose(req -> req
+        .send()
+        .map(HttpClientResponse::statusCode))
+      .await();
+    assertEquals(200, (int) sc);
+  }
+
+  @Test
+  public void testFollowRedirectQueryOn301() throws Exception {
+    testFollowRedirect(HttpMethod.QUERY, HttpMethod.QUERY, 301, 200, 2,
+      "http://" + config.host() + ":" + config.port() + "/redirected",
+      "http://" + config.host() + ":" + config.port() + "/redirected");
+  }
+
+  @Test
+  public void testFollowRedirectQueryOn302() throws Exception {
+    testFollowRedirect(HttpMethod.QUERY, HttpMethod.QUERY, 302, 200, 2,
+      "http://" + config.host() + ":" + config.port() + "/redirected",
+      "http://" + config.host() + ":" + config.port() + "/redirected");
+  }
+
+  @Test
+  public void testFollowRedirectQueryOn303() throws Exception {
+    testFollowRedirect(HttpMethod.QUERY, HttpMethod.GET, 303, 200, 2,
+      "http://" + config.host() + ":" + config.port() + "/redirected",
+      "http://" + config.host() + ":" + config.port() + "/redirected");
+  }
+
+  @Test
+  public void testFollowRedirectQueryOn307() throws Exception {
+    testFollowRedirect(HttpMethod.QUERY, HttpMethod.QUERY, 307, 200, 2,
+      "http://" + config.host() + ":" + config.port() + "/redirected",
+      "http://" + config.host() + ":" + config.port() + "/redirected");
+  }
+
+  @Test
+  public void testFollowRedirectQueryOn308() throws Exception {
+    testFollowRedirect(HttpMethod.QUERY, HttpMethod.QUERY, 308, 200, 2,
+      "http://" + config.host() + ":" + config.port() + "/redirected",
+      "http://" + config.host() + ":" + config.port() + "/redirected");
+  }
+
+  @Test
+  public void testFollowRedirectGetOn301() throws Exception {
+    testFollowRedirect(HttpMethod.GET, HttpMethod.GET, 301, 200, 2, "http://" + config.host() + ":" + config.port() + "/redirected", "http://" + config.host() + ":" + config.port() + "/redirected");
+  }
+
+  @Test
+  public void testFollowRedirectPostOn301() throws Exception {
+    testFollowRedirect(HttpMethod.POST, HttpMethod.GET, 301, 301, 1, "http://" + config.host() + ":" + config.port() + "/redirected", "http://" + config.host() + ":" + config.port() + "/somepath");
+  }
+
+  @Test
+  public void testFollowRedirectPutOn301() throws Exception {
+    testFollowRedirect(HttpMethod.PUT, HttpMethod.GET, 301, 301, 1, "http://" + config.host() + ":" + config.port() + "/redirected", "http://" + config.host() + ":" + config.port() + "/somepath");
+  }
+
+  @Test
+  public void testFollowRedirectGetOn302() throws Exception {
+    testFollowRedirect(HttpMethod.GET, HttpMethod.GET, 302, 200, 2, "http://" + config.host() + ":" + config.port() + "/redirected", "http://" + config.host() + ":" + config.port() + "/redirected");
+  }
+
+  @Test
+  public void testFollowRedirectPostOn302() throws Exception {
+    testFollowRedirect(HttpMethod.POST, HttpMethod.GET, 302, 302, 1, "http://" + config.host() + ":" + config.port() + "/redirected", "http://" + config.host() + ":" + config.port() + "/somepath");
+  }
+
+  @Test
+  public void testFollowRedirectPutOn302() throws Exception {
+    testFollowRedirect(HttpMethod.PUT, HttpMethod.GET, 302, 302, 1, "http://" + config.host() + ":" + config.port() + "/redirected", "http://" + config.host() + ":" + config.port() + "/somepath");
+  }
+
+  @Test
+  public void testFollowRedirectGetOn303() throws Exception {
+    testFollowRedirect(HttpMethod.GET, HttpMethod.GET, 303, 200, 2, "http://" + config.host() + ":" + config.port() + "/redirected", "http://" + config.host() + ":" + config.port() + "/redirected");
+  }
+
+  @Test
+  public void testFollowRedirectPostOn303() throws Exception {
+    testFollowRedirect(HttpMethod.POST, HttpMethod.GET, 303, 200, 2, "http://" + config.host() + ":" + config.port() + "/redirected", "http://" + config.host() + ":" + config.port() + "/redirected");
+  }
+
+  @Test
+  public void testFollowRedirectPutOn303() throws Exception {
+    testFollowRedirect(HttpMethod.PUT, HttpMethod.GET, 303, 200, 2, "http://" + config.host() + ":" + config.port() + "/redirected", "http://" + config.host() + ":" + config.port() + "/redirected");
+  }
+
+  @Test
+  public void testFollowRedirectNotOn304() throws Exception {
+    testFollowRedirect(HttpMethod.GET, HttpMethod.GET, 304, 304, 1, "http://" + config.host() + ":" + config.port() + "/redirected", "http://" + config.host() + ":" + config.port() + "/somepath");
+  }
+
+  @Test
+  public void testFollowRedirectGetOn307() throws Exception {
+    testFollowRedirect(HttpMethod.GET, HttpMethod.GET, 307, 200, 2, "http://" + config.host() + ":" + config.port() + "/redirected", "http://" + config.host() + ":" + config.port() + "/redirected");
+  }
+
+  @Test
+  public void testFollowRedirectPostOn307() throws Exception {
+    testFollowRedirect(HttpMethod.POST, HttpMethod.POST, 307, 307, 1, "http://" + config.host() + ":" + config.port() + "/redirected", "http://" + config.host() + ":" + config.port() + "/somepath");
+  }
+
+  @Test
+  public void testFollowRedirectPutOn307() throws Exception {
+    testFollowRedirect(HttpMethod.PUT, HttpMethod.PUT, 307, 307, 1, "http://" + config.host() + ":" + config.port() + "/redirected", "http://" + config.host() + ":" + config.port() + "/somepath");
+  }
+
+  @Test
+  public void testFollowRedirectWithRelativeLocation() throws Exception {
+    testFollowRedirect(HttpMethod.GET, HttpMethod.GET, 301, 200, 2, "/another", "http://" + config.host() + ":" + config.port() + "/another");
+  }
+
+  @Test
+  public void testFollowRedirectGetOn308() throws Exception {
+    testFollowRedirect(HttpMethod.GET, HttpMethod.GET, 308, 200, 2, "http://" + config.host() + ":" + config.port() + "/redirected", "http://" + config.host() + ":" + config.port() + "/redirected");
+  }
+
+  @Test
+  public void testFollowRedirectPostOn308() throws Exception {
+    testFollowRedirect(HttpMethod.POST, HttpMethod.POST, 308, 308, 1, "http://" + config.host() + ":" + config.port() + "/redirected", "http://" + config.host() + ":" + config.port() + "/somepath");
+  }
+
+  @Test
+  public void testFollowRedirectPutOn308() throws Exception {
+    testFollowRedirect(HttpMethod.PUT, HttpMethod.PUT, 308, 308, 1, "http://" + config.host() + ":" + config.port() + "/redirected", "http://" + config.host() + ":" + config.port() + "/somepath");
+  }
+
+  private void testFollowRedirect(
+      HttpMethod method,
+      HttpMethod expectedMethod,
+      int statusCode,
+      int expectedStatus,
+      int expectedRequests,
+      String location,
+      String expectedURI) throws Exception {
+    AtomicInteger numRequests = new AtomicInteger();
+    Buffer expectedBody = Buffer.buffer(TestUtils.randomAlphaString(256));
+    server.requestHandler(req -> {
+      HttpServerResponse resp = req.response();
+      if (numRequests.getAndIncrement() == 0) {
+        resp.setStatusCode(statusCode);
+        String s;
+        if (req.connection().isSsl() && location.startsWith("http://")) {
+          s = "https://" + location.substring("http://".length());
+        } else {
+          s = location;
+        }
+        if (s != null) {
+          resp.putHeader(HttpHeaders.LOCATION, s);
+        }
+        resp.end();
+      } else {
+        String t;
+        if (req.connection().isSsl() && expectedURI.startsWith("http://")) {
+          t = "https://" + expectedURI.substring("http://".length());
+        } else {
+          t = expectedURI;
+        }
+        assertEquals(t, req.absoluteURI());
+        assertEquals("foo_value", req.getHeader("foo"));
+        assertEquals(expectedMethod, req.method());
+        resp.end(expectedBody);
+      }
+    });
+    startServer(testAddress);
+    client.request(
+      new RequestOptions(requestOptions)
+        .setServer(null)
+        .setMethod(method)
+        .setURI("/somepath")
+    )
+      .compose(req -> req
+        .putHeader("foo", "foo_value")
+        .setFollowRedirects(true)
+        .send()
+        .compose(resp -> {
+          String t;
+          if (req.connection().isSsl() && expectedURI.startsWith("http://")) {
+            t = "https://" + expectedURI.substring("http://".length());
+          } else {
+            t = expectedURI;
+          }
+          assertEquals(resp.request().absoluteURI(), t);
+          assertEquals(expectedRequests, numRequests.get());
+          assertEquals(expectedStatus, resp.statusCode());
+          return resp.body().compose(body -> {
+            if (resp.statusCode() == 200) {
+              assertEquals(expectedBody, body);
+            } else {
+              assertEquals(Buffer.buffer(), body);
+            }
+            return Future.succeededFuture();
+          });
+        })
+      ).await();
+  }
+
+  @Test
+  public void testFollowRedirectQueryWithBody() throws Exception {
+    Buffer expected = TestUtils.randomBuffer(2048);
+    server.requestHandler(req -> {
+      if ("/".equals(req.path())) {
+        assertEquals(HttpMethod.QUERY, req.method());
+        req.body().onComplete(TestUtils.onSuccess(body -> {
+          assertEquals(expected, body);
+          String scheme = req.connection().isSsl() ? "https" : "http";
+          req.response().setStatusCode(307).putHeader(HttpHeaders.LOCATION, scheme + "://" + config.host() + ":" + config.port() + "/whatever").end();
+        }));
+      } else if ("/whatever".equals(req.path())) {
+        assertEquals(HttpMethod.QUERY, req.method());
+        req.body().onComplete(TestUtils.onSuccess(body -> {
+          assertEquals(expected, body);
+          req.response().end();
+        }));
+      } else {
+        req.response().setStatusCode(404).end();
+      }
+    });
+    startServer(testAddress);
+    RequestOptions opts = new RequestOptions()
+      .setMethod(QUERY)
+      .setHost(config.host())
+      .setPort(config.port());
+    client.request(opts).compose(req -> req
+        .setFollowRedirects(true)
+        .send(expected)
+        .expecting(HttpResponseExpectation.SC_OK))
+      .await();
+  }
+
+  @Test
+  public void testFollowRedirectQueryWithBodyExceedingLimit() throws Exception {
+    Buffer expected = TestUtils.randomBuffer(4 * 1024 + 1); // 4KB + 1B
+    server.requestHandler(req -> {
+      if ("/".equals(req.path())) {
+        assertEquals(HttpMethod.QUERY, req.method());
+        req.body().onComplete(TestUtils.onSuccess(body -> {
+          assertEquals(expected, body);
+          String scheme = req.connection().isSsl() ? "https" : "http";
+          req.response().setStatusCode(307).putHeader(HttpHeaders.LOCATION, scheme + "://" + config.host() + ":" + config.port() + "/whatever").end();
+        }));
+      } else {
+        fail("Should not redirect");
+      }
+    });
+    startServer(testAddress);
+    RequestOptions opts = new RequestOptions()
+      .setMethod(QUERY)
+      .setHost(config.host())
+      .setPort(config.port());
+    client.request(opts).compose(req -> req
+        .setFollowRedirects(true)
+        .send(expected)
+        .expecting(HttpResponseExpectation.status(307)))
+      .await();
+  }
+
+  @Test
+  public void testFollowRedirectQueryWithConfiguredBodyExceedingLimit() throws Exception {
+    Buffer expected = TestUtils.randomBuffer(2048);
+    server.requestHandler(req -> {
+      if ("/".equals(req.path())) {
+        assertEquals(HttpMethod.QUERY, req.method());
+        req.body().onComplete(TestUtils.onSuccess(body -> {
+          assertEquals(expected, body);
+          String scheme = req.connection().isSsl() ? "https" : "http";
+          req.response().setStatusCode(307).putHeader(HttpHeaders.LOCATION, scheme + "://" + config.host() + ":" + config.port() + "/whatever").end();
+        }));
+      } else {
+        fail("Should not redirect");
+      }
+    });
+    startServer(testAddress);
+    client = config.forClient().setMaxRedirectBufferSize(1024).create(vertx);
+    RequestOptions opts = new RequestOptions()
+      .setMethod(QUERY)
+      .setHost(config.host())
+      .setPort(config.port());
+    client.request(opts).compose(req -> req
+        .setFollowRedirects(true)
+        .send(expected)
+        .expecting(HttpResponseExpectation.status(307)))
+      .await();
+  }
+
+  @Test
+  public void testFollowRedirectQueryWithMultipleBuffers() throws Exception {
+    Buffer chunk1 = TestUtils.randomBuffer(1024);
+    Buffer chunk2 = TestUtils.randomBuffer(1024);
+    Buffer expected = Buffer.buffer().appendBuffer(chunk1).appendBuffer(chunk2);
+    server.requestHandler(req -> {
+      if ("/".equals(req.path())) {
+        assertEquals(HttpMethod.QUERY, req.method());
+        req.body().onComplete(TestUtils.onSuccess(body -> {
+          assertEquals(expected, body);
+          String scheme = req.connection().isSsl() ? "https" : "http";
+          req.response().setStatusCode(307).putHeader(HttpHeaders.LOCATION, scheme + "://" + config.host() + ":" + config.port() + "/whatever").end();
+        }));
+      } else if ("/whatever".equals(req.path())) {
+        assertEquals(HttpMethod.QUERY, req.method());
+        req.body().onComplete(TestUtils.onSuccess(body -> {
+          assertEquals(expected, body);
+          req.response().end();
+        }));
+      } else {
+        req.response().setStatusCode(404).end();
+      }
+    });
+    startServer(testAddress);
+    RequestOptions opts = new RequestOptions()
+      .setMethod(QUERY)
+      .setHost(config.host())
+      .setPort(config.port());
+    client.request(opts).compose(req -> {
+      req.setFollowRedirects(true);
+      req.write(chunk1);
+      req.end(chunk2);
+      return req.response().expecting(HttpResponseExpectation.SC_OK);
+    }).await();
+  }
+
+  @Test
+  public void testFollowRedirectQueryWithStream() throws Exception {
+    Buffer chunk1 = TestUtils.randomBuffer(1024);
+    Buffer chunk2 = TestUtils.randomBuffer(1024);
+    Buffer expected = Buffer.buffer().appendBuffer(chunk1).appendBuffer(chunk2);
+    server.requestHandler(req -> {
+      if ("/".equals(req.path())) {
+        assertEquals(HttpMethod.QUERY, req.method());
+        req.body().onComplete(TestUtils.onSuccess(body -> {
+          assertEquals(expected, body);
+          String scheme = req.connection().isSsl() ? "https" : "http";
+          req.response().setStatusCode(307).putHeader(HttpHeaders.LOCATION, scheme + "://" + config.host() + ":" + config.port() + "/whatever").end();
+        }));
+      } else if ("/whatever".equals(req.path())) {
+        assertEquals(HttpMethod.QUERY, req.method());
+        req.body().onComplete(TestUtils.onSuccess(body -> {
+          assertEquals(expected, body);
+          req.response().end();
+        }));
+      } else {
+        req.response().setStatusCode(404).end();
+      }
+    });
+    startServer(testAddress);
+    FakeStream<Buffer> stream = new FakeStream<>();
+    stream.pause();
+    RequestOptions opts = new RequestOptions()
+      .setMethod(QUERY)
+      .setHost(config.host())
+      .setPort(config.port());
+    Future<HttpClientResponse> responseFuture = client.request(opts).compose(req -> {
+      req.setFollowRedirects(true);
+      return req.send(stream);
+    });
+    stream.write(chunk1);
+    stream.write(chunk2);
+    stream.end();
+    responseFuture.compose(HttpClientResponse::end).await();
+  }
+
+  @Test
+  public void testFollowRedirectWithBody() throws Exception {
+    testFollowRedirectWithBody(Function.identity());
+  }
+
+  @Test
+  public void testFollowRedirectWithPaddedBody() throws Exception {
+    testFollowRedirectWithBody(buff -> TestUtils.leftPad(1, buff));
+  }
+
+  private void testFollowRedirectWithBody(Function<Buffer, Buffer> translator) throws Exception {
+    Buffer expected = TestUtils.randomBuffer(2048);
+    AtomicBoolean redirected = new AtomicBoolean();
+    server.requestHandler(req -> {
+      if (redirected.compareAndSet(false, true)) {
+        assertEquals(HttpMethod.PUT, req.method());
+        req.bodyHandler(body -> {
+          assertEquals(body, expected);
+          String scheme = req.connection().isSsl() ? "https" : "http";
+          req.response().setStatusCode(303).putHeader(HttpHeaders.LOCATION, scheme + "://" + config.host() + ":" + config.port() + "/whatever").end();
+        });
+      } else {
+        assertEquals(HttpMethod.GET, req.method());
+        assertNull(req.getHeader(HttpHeaders.CONTENT_LENGTH));
+        req.response().end();
+      }
+    });
+    startServer(testAddress);
+    RequestOptions opts = new RequestOptions()
+      .setMethod(PUT)
+      .setHost(config.host())
+      .setPort(config.port());
+    client.request(opts).compose(req -> req
+        .setFollowRedirects(true)
+        .send(translator.apply(expected))
+        .expecting(HttpResponseExpectation.SC_OK))
+      .await();
+  }
+
+  @Test
+  public void testFollowRedirectHappensAfterResponseIsReceived() throws Exception {
+    AtomicBoolean redirected = new AtomicBoolean();
+    AtomicBoolean sent = new AtomicBoolean();
+    server.requestHandler(req -> {
+      HttpServerResponse resp = req.response();
+      if (redirected.compareAndSet(false, true)) {
+        String scheme = req.connection().isSsl() ? "https" : "http";
+        resp
+          .setStatusCode(303)
+          .putHeader(HttpHeaders.CONTENT_LENGTH, "11")
+          .putHeader(HttpHeaders.LOCATION, scheme + "://" + config.host() + ":" + config.port() + "/whatever")
+          .write("hello ");
+        vertx.setTimer(500, id -> {
+          sent.set(true);
+          resp.end("world");
+        });
+      } else {
+        assertTrue(sent.get());
+        resp.end();
+      }
+    });
+    startServer(testAddress);
+    RequestOptions opts = new RequestOptions().setMethod(PUT).setHost(config.host()).setPort(config.port());
+    client.request(opts).compose(req -> req
+        .setFollowRedirects(true)
+        .send()
+        .expecting(HttpResponseExpectation.SC_OK)
+        .compose(HttpClientResponse::end))
+      .await();
+  }
+
+  @Test
+  public void testFollowRedirectWithChunkedBody() throws Exception {
+    Buffer buff1 = Buffer.buffer(TestUtils.randomAlphaString(2048));
+    Buffer buff2 = Buffer.buffer(TestUtils.randomAlphaString(2048));
+    Buffer expected = Buffer.buffer().appendBuffer(buff1).appendBuffer(buff2);
+    AtomicBoolean redirected = new AtomicBoolean();
+    Promise<Void> latch = Promise.promise();
+    server.requestHandler(req -> {
+      boolean redirect = redirected.compareAndSet(false, true);
+      if (redirect) {
+        latch.complete();
+      }
+      if (redirect) {
+        assertEquals(HttpMethod.PUT, req.method());
+        req.bodyHandler(body -> {
+          assertEquals(body, expected);
+          String scheme = req.connection().isSsl() ? "https" : "http";
+          req.response().setStatusCode(303).putHeader(HttpHeaders.LOCATION, scheme + "://" + config.host() + ":" + config.port() + "/whatever").end();
+        });
+      } else {
+        assertEquals(HttpMethod.GET, req.method());
+        req.response().end();
+      }
+    });
+    startServer(testAddress);
+    client.request(new RequestOptions()
+      .setMethod(HttpMethod.PUT)
+      .setHost(config.host())
+      .setPort(config.port())
+      .setURI(DEFAULT_TEST_URI)
+    )
+      .compose(req -> {
+        latch.future().onSuccess(v -> {
+          req.end(buff2);
+        });
+        req.setFollowRedirects(true);
+        req.setChunked(true);
+        req.write(buff1);
+        return req.response()
+          .expecting(HttpResponseExpectation.SC_OK
+        ).compose(HttpClientResponse::end);
+      }).await();
+  }
+
+  @Test
+  public void testFollowRedirectWithRequestNotEnded(Checkpoint checkpoint) throws Exception {
+    testFollowRedirectWithRequestNotEnded(checkpoint, false);
+  }
+
+  @Test
+  public void testFollowRedirectWithRequestNotEndedFailing(Checkpoint checkpoint) throws Exception {
+    testFollowRedirectWithRequestNotEnded(checkpoint, true);
+  }
+
+  private void testFollowRedirectWithRequestNotEnded(Checkpoint checkpoint1, boolean expectFail) throws Exception {
+    Buffer buff1 = Buffer.buffer(TestUtils.randomAlphaString(2048));
+    Buffer buff2 = Buffer.buffer(TestUtils.randomAlphaString(2048));
+    Buffer expected = Buffer.buffer().appendBuffer(buff1).appendBuffer(buff2);
+    AtomicBoolean redirected = new AtomicBoolean();
+    Promise<Void> latch = Promise.promise();
+    server.requestHandler(req -> {
+      boolean redirect = redirected.compareAndSet(false, true);
+      if (redirect) {
+        Buffer body = Buffer.buffer();
+        req.handler(buff -> {
+          if (body.length() == 0) {
+            HttpServerResponse resp = req.response();
+            String scheme = req.connection().isSsl() ? "https" : "http";
+            resp.setStatusCode(303).putHeader(HttpHeaders.LOCATION, scheme + "://" + config.host() + ":" + config.port() + "/whatever");
+            if (expectFail) {
+              resp
+                .setChunked(true)
+                .write("whatever")
+                .onComplete(TestUtils.onSuccess(v -> req.response().reset()));
+            } else {
+              resp.end();
+            }
+            latch.complete();
+          }
+          body.appendBuffer(buff);
+        });
+        req.endHandler(v -> assertEquals(expected, body));
+      } else {
+        req.response().end();
+      }
+    });
+    startServer(testAddress);
+    AtomicBoolean called = new AtomicBoolean();
+    client.request(new RequestOptions(requestOptions)
+      .setMethod(HttpMethod.PUT)).onComplete(TestUtils.onSuccess(req -> {
+        req.response().onComplete(ar -> {
+          assertEquals(expectFail, ar.failed());
+          if (ar.succeeded()) {
+            HttpClientResponse resp = ar.result();
+            assertEquals(200, resp.statusCode());
+            checkpoint1.succeed();
+          } else {
+            if (called.compareAndSet(false, true)) {
+              checkpoint1.succeed();
+            }
+          }
+        });
+        latch.future().onComplete(TestUtils.onSuccess(v -> {
+          // Wait so we end the request while having received the server response (but we can't be notified)
+          if (!expectFail) {
+            vertx.setTimer(500, id -> {
+              req.end(buff2);
+            });
+          }
+        }));
+        req
+          .setFollowRedirects(true)
+          .setChunked(true)
+          .write(buff1);
+    }));
+  }
+
+  @Test
+  public void testFollowRedirectwriteHeadThenBody() throws Exception {
+    Buffer expected = Buffer.buffer(TestUtils.randomAlphaString(2048));
+    AtomicBoolean redirected = new AtomicBoolean();
+    server.requestHandler(req -> {
+      if (redirected.compareAndSet(false, true)) {
+        assertEquals(HttpMethod.PUT, req.method());
+        req.bodyHandler(body -> {
+          assertEquals(body, expected);
+          req.response().setStatusCode(303).putHeader(HttpHeaders.LOCATION, "/whatever").end();
+        });
+      } else {
+        assertEquals(HttpMethod.GET, req.method());
+        req.response().end();
+      }
+    });
+    startServer(testAddress);
+    RequestOptions opts = new RequestOptions()
+      .setMethod(PUT)
+      .setHost(config.host())
+      .setPort(config.port())
+      .setURI("/somepath");
+    client.request(opts).compose(req -> {
+      req
+        .setFollowRedirects(true)
+        .putHeader("Content-Length", "" + expected.length())
+        .writeHead().onComplete(TestUtils.onSuccess(v -> {
+        req.end(expected);
+      }));
+      return req
+        .response()
+        .expecting(HttpResponseExpectation.SC_OK)
+        .compose(HttpClientResponse::end);
+    }).await();
+  }
+
+  @Test
+  public void testFollowRedirectLimit() throws Exception {
+    assumeTrue(testAddress.isInetSocket());
+    AtomicInteger numberOfRequests = new AtomicInteger();
+    server.requestHandler(req -> {
+      int val = numberOfRequests.incrementAndGet();
+      if (val > 17) {
+        Assert.fail();
+      } else {
+        String scheme = req.connection().isSsl() ? "https" : "http";
+        req.response().setStatusCode(301).putHeader(HttpHeaders.LOCATION, scheme + "://" + config.host() + ":" + config.port() + "/otherpath").end();
+      }
+    });
+    startServer(testAddress);
+    client.request(requestOptions)
+      .compose(req -> {
+        req.setFollowRedirects(true);
+        return req.send().compose(resp -> {
+          assertEquals(17, numberOfRequests.get());
+          assertEquals(301, resp.statusCode());
+          assertEquals("/otherpath", resp.request().path());
+          return resp.end();
+        });
+      }).await();
+  }
+
+  @Test
+  public void testFollowRedirectPropagatesTimeout(Checkpoint checkpoint) throws Exception {
+    assumeTrue(testAddress.isInetSocket());
+    AtomicInteger redirections = new AtomicInteger();
+    server.requestHandler(req -> {
+      switch (redirections.getAndIncrement()) {
+        case 0:
+          String scheme = req.connection().isSsl() ? "https" : "http";
+          req.response().setStatusCode(307).putHeader(HttpHeaders.LOCATION, scheme + "://" + config.host() + ":" + config.port() + "/whatever").end();
+          break;
+      }
+    });
+    startServer(testAddress);
+    AtomicBoolean done = new AtomicBoolean();
+    client.request(new RequestOptions(requestOptions)
+      .setIdleTimeout(500)).onComplete(TestUtils.onSuccess(req -> {
+      req
+        .setFollowRedirects(true)
+        .send()
+        .onComplete(TestUtils.onFailure(t -> {
+        if (done.compareAndSet(false, true)) {
+          assertEquals(2, redirections.get());
+          checkpoint.succeed();
+        }
+      }));
+    }));
+  }
+
+  @Test
+  public void testFollowRedirectHost(Checkpoint checkpoint1, Checkpoint checkpoint2) throws Exception {
+    int port = config.port() + 1;
+    AtomicInteger redirects = new AtomicInteger();
+    server.requestHandler(req -> {
+      redirects.incrementAndGet();
+      req.response().setStatusCode(301).putHeader(HttpHeaders.LOCATION, req.scheme() + "://localhost:" + (server.actualPort() + 1) + "/whatever").end();
+    });
+    startServer(testAddress);
+    HttpServer server2 = createHttpServer();
+    server2.requestHandler(req -> {
+      assertEquals(1, redirects.get());
+      assertEquals(req.scheme() + "://localhost:" + port + "/whatever", req.absoluteURI());
+      req.response().end();
+      checkpoint1.succeed();
+    });
+    startServer(inetSocketAddress(port, testAddress.host()), server2);
+    client.request(requestOptions)
+      .compose(req -> req
+        .setFollowRedirects(true)
+        // .setAuthority("localhost:" + options.getPort())
+        .send()
+      )
+      .onComplete(TestUtils.onSuccess(resp -> {
+        String scheme = resp.request().connection().isSsl() ? "https" : "http";
+        assertEquals(scheme + "://localhost:" + port + "/whatever", resp.request().absoluteURI());
+        checkpoint2.succeed();
+      }));
+  }
+
+  @Test
+  public void testFollowRedirectWithCustomHandler(Checkpoint checkpoint1, Checkpoint checkpoint2) throws Exception {
+    int basePort = config.port();
+    SocketAddress redirectedServerAddress = inetSocketAddress(basePort + 1, testAddress.host());
+    AtomicInteger redirects = new AtomicInteger();
+    server.requestHandler(req -> {
+      redirects.incrementAndGet();
+      req.response().setStatusCode(301).putHeader(HttpHeaders.LOCATION, req.scheme() + "://localhost:" + (server.actualPort() + 1) + "/whatever").end();
+    });
+    startServer(testAddress);
+    HttpServer redirectedServer = createHttpServer();
+    redirectedServer.requestHandler(req -> {
+      assertEquals(1, redirects.get());
+      assertEquals(req.scheme() + "://localhost:" + redirectedServerAddress.port() + "/custom", req.absoluteURI());
+      req.response().end();
+      checkpoint1.succeed();
+    });
+    startServer(redirectedServerAddress, redirectedServer);
+    Context ctx = vertx.getOrCreateContext();
+    client = httpClientBuilder()
+      .withRedirectHandler(resp -> {
+        assertEquals(ctx, Vertx.currentContext());
+        Promise<RequestOptions> fut = Promise.promise();
+        vertx.setTimer(25, id -> {
+          fut.complete(new RequestOptions().setAbsoluteURI((resp.request().connection().isSsl() ? "https" : "http") + "://localhost:" + redirectedServerAddress.port() + "/custom"));
+        });
+        return fut.future();
+      })
+      .build();
+    ctx.runOnContext(v -> {
+      client.request(new RequestOptions()
+          .setHost(config.host())
+          .setPort(config.port()))
+        .compose(req -> req
+          .setFollowRedirects(true)
+          .putHeader("foo", "foo_value")
+          .send()
+          .compose(resp -> {
+            assertEquals((req.connection().isSsl() ? "https" : "http") + "://localhost:" + redirectedServerAddress.port() + "/custom", resp.request().absoluteURI());
+            return resp.end();
+          }))
+        .onComplete(checkpoint2);
+    });
+  }
+
+  @Test
+  public void testDefaultRedirectHandler() throws Exception {
+    testFoo("http://example.com", "http://example.com");
+    testFoo("http://example.com/somepath", "http://example.com/somepath");
+    testFoo("http://example.com:8000", "http://example.com:8000");
+    testFoo("http://example.com:8000/somepath", "http://example.com:8000/somepath");
+    testFoo("https://example.com", "https://example.com");
+    testFoo("https://example.com/somepath", "https://example.com/somepath");
+    testFoo("https://example.com:8000", "https://example.com:8000");
+    testFoo("https://example.com:8000/somepath", "https://example.com:8000/somepath");
+    testFoo("whatever://example.com", null);
+    testFoo("http://", null);
+    testFoo("http://:" + config.host() + ":" + config.port() + "/somepath", null);
+  }
+
+  private void testFoo(String location, String expectedAbsoluteURI) throws Exception {
+    int status = 301;
+    MultiMap headers = HttpHeaders.headers().add(HttpHeaders.LOCATION.toString(), location);
+    HttpMethod method = HttpMethod.GET;
+    String baseURI = "https://" + config.host() + ":" + config.port();
+
+    class MockHttpConn implements HttpConnection {
+      public HttpVersion protocolVersion() { return config.version(); }
+      public HttpConnection goAway(long errorCode, int lastStreamId, Buffer debugData) { throw new UnsupportedOperationException(); }
+      public HttpConnection goAwayHandler(Handler<GoAway> handler) { throw new UnsupportedOperationException(); }
+      public HttpConnection shutdownHandler(Handler<Void> handler) { throw new UnsupportedOperationException(); }
+      public Future<Void> shutdown(Duration timeout) { throw new UnsupportedOperationException(); }
+      public HttpConnection closeHandler(Handler<Void> handler) { throw new UnsupportedOperationException(); }
+      public HttpSettings settings() { throw new UnsupportedOperationException(); }
+      public Future<Void> updateSettings(HttpSettings settings) { throw new UnsupportedOperationException(); }
+      public HttpSettings remoteSettings() { throw new UnsupportedOperationException(); }
+      public HttpConnection remoteSettingsHandler(Handler<HttpSettings> handler) { throw new UnsupportedOperationException(); }
+      public Future<Buffer> ping(Buffer data) { throw new UnsupportedOperationException(); }
+      public HttpConnection pingHandler(Handler<Buffer> handler) { throw new UnsupportedOperationException(); }
+      public HttpConnection exceptionHandler(Handler<Throwable> handler) { throw new UnsupportedOperationException(); }
+      public SocketAddress remoteAddress() { throw new UnsupportedOperationException(); }
+      public SocketAddress remoteAddress(boolean real) { throw new UnsupportedOperationException(); }
+      public SocketAddress localAddress() { throw new UnsupportedOperationException(); }
+      public SocketAddress localAddress(boolean real) { throw new UnsupportedOperationException(); }
+      public boolean isSsl() { return true; }
+      public SSLSession sslSession() { throw new UnsupportedOperationException(); }
+      public String indicatedServerName() { return ""; }
+    }
+
+    class MockReq implements HttpClientRequest {
+      public HttpClientRequest exceptionHandler(Handler<Throwable> handler) { throw new UnsupportedOperationException(); }
+      public Future<Void> write(Buffer data) { throw new UnsupportedOperationException(); }
+      public HttpClientRequest setWriteQueueMaxSize(int maxSize) { throw new UnsupportedOperationException(); }
+      public HttpClientRequest drainHandler(Handler<Void> handler) { throw new UnsupportedOperationException(); }
+      public HttpClientRequest setFollowRedirects(boolean followRedirects) { throw new UnsupportedOperationException(); }
+      public HttpClientRequest setMaxRedirects(int maxRedirects) { throw new UnsupportedOperationException(); }
+      public HttpClientRequest setChunked(boolean chunked) { throw new UnsupportedOperationException(); }
+      public boolean isChunked() { return false; }
+      public HttpClientRequest authority(HostAndPort authority) { throw new UnsupportedOperationException(); }
+      public HostAndPort authority() { return HostAndPort.authority(DEFAULT_HTTP_HOST, DEFAULT_HTTP_PORT); }
+      public HttpMethod getMethod() { return method; }
+      public String absoluteURI() { return baseURI; }
+      public HttpVersion version() { return HttpVersion.HTTP_1_1; }
+      public String getURI() { throw new UnsupportedOperationException(); }
+      public HttpClientRequest setURI(String uri) { throw new UnsupportedOperationException(); }
+      public String path() { throw new UnsupportedOperationException(); }
+      public String query() { throw new UnsupportedOperationException(); }
+      public MultiMap headers() { return headers; }
+      public HttpClientRequest putHeader(String name, String value) { throw new UnsupportedOperationException(); }
+      public HttpClientRequest putHeader(CharSequence name, CharSequence value) { throw new UnsupportedOperationException(); }
+      public HttpClientRequest putHeader(String name, Iterable<String> values) { throw new UnsupportedOperationException(); }
+      public HttpClientRequest putHeader(CharSequence name, Iterable<CharSequence> values) { throw new UnsupportedOperationException(); }
+      public MultiMap trailers() { throw new UnsupportedOperationException(); }
+      public HttpClientRequest putTrailer(String name, String value) { throw new UnsupportedOperationException(); }
+      public HttpClientRequest putTrailer(CharSequence name, CharSequence value) { throw new UnsupportedOperationException(); }
+      public HttpClientRequest putTrailer(String name, Iterable<String> values) { throw new UnsupportedOperationException(); }
+      public HttpClientRequest putTrailer(CharSequence name, Iterable<CharSequence> values) { throw new UnsupportedOperationException(); }
+      public Future<Void> write(String chunk) { throw new UnsupportedOperationException(); }
+      public Future<Void> write(String chunk, String enc) { throw new UnsupportedOperationException(); }
+      public HttpClientRequest traceOperation(String op) { throw new UnsupportedOperationException(); }
+      public String traceOperation() { throw new UnsupportedOperationException(); }
+      public HttpClientRequest continueHandler(@Nullable Handler<Void> handler) { throw new UnsupportedOperationException(); }
+      public boolean isFollowRedirects() { throw new UnsupportedOperationException(); }
+      public int getMaxRedirects() { throw new UnsupportedOperationException(); }
+      public int maxRedirectBufferSize() { throw new UnsupportedOperationException(); }
+      public HttpClientRequest maxRedirectBufferSize(int maxRedirectBufferSize) { throw new UnsupportedOperationException(); }
+      public int numberOfRedirections() { throw new UnsupportedOperationException(); }
+      public HttpClientRequest redirectHandler(@Nullable Function<HttpClientResponse, Future<HttpClientRequest>> handler) { throw new UnsupportedOperationException(); }
+      public HttpClientRequest earlyHintsHandler(@Nullable Handler<MultiMap> handler) { throw new UnsupportedOperationException(); }
+      public Future<Void> sendHead() { throw new UnsupportedOperationException(); }
+      public Future<HttpClientResponse> send(ClientForm form) { throw new UnsupportedOperationException(); }
+      public Future<HttpClientResponse> connect() { throw new UnsupportedOperationException(); }
+      public Future<Void> end(String chunk) { throw new UnsupportedOperationException(); }
+      public Future<Void> end(String chunk, String enc) { throw new UnsupportedOperationException(); }
+      public Future<Void> end() { throw new UnsupportedOperationException(); }
+      public Future<Void> end(Buffer chunk) { throw new UnsupportedOperationException(); }
+      public HttpClientRequest idleTimeout(long timeoutMs) { throw new UnsupportedOperationException(); }
+      public HttpClientRequest pushHandler(Handler<HttpClientRequest> handler) { throw new UnsupportedOperationException(); }
+      public Future<Void> reset(long code) { return Future.failedFuture(new UnsupportedOperationException()); }
+      public Future<Void> reset(long code, Throwable cause) { return Future.failedFuture(new UnsupportedOperationException()); }
+      public Future<Boolean> cancel() { return Future.failedFuture(new UnsupportedOperationException()); }
+      public HttpConnection connection() { return new MockHttpConn(); }
+      public Future<Void> writeCustomFrame(int type, int flags, Buffer payload) { throw new UnsupportedOperationException(); }
+      public boolean writeQueueFull() { throw new UnsupportedOperationException(); }
+      public StreamPriority getStreamPriority() { return null; }
+      public HttpClientRequest setMethod(HttpMethod method) { throw new UnsupportedOperationException(); }
+      public Future<HttpClientResponse> response() { throw new UnsupportedOperationException(); }
+    }
+    HttpClientRequest req = new MockReq();
+    class MockResp implements HttpClientResponse {
+      public HttpClientResponse resume() { throw new UnsupportedOperationException(); }
+      public HttpClientResponse exceptionHandler(Handler<Throwable> handler) { throw new UnsupportedOperationException(); }
+      public HttpClientResponse handler(Handler<Buffer> handler) { throw new UnsupportedOperationException(); }
+      public HttpClientResponse pause() { throw new UnsupportedOperationException(); }
+      public HttpClientResponse fetch(long amount) { throw new UnsupportedOperationException(); }
+      public HttpClientResponse endHandler(Handler<Void> endHandler) { throw new UnsupportedOperationException(); }
+      public HttpVersion version() { throw new UnsupportedOperationException(); }
+      public int statusCode() { return status; }
+      public String statusMessage() { throw new UnsupportedOperationException(); }
+      public MultiMap headers() { throw new UnsupportedOperationException(); }
+      public String getHeader(String headerName) { return headers.get(headerName); }
+      public String getHeader(CharSequence headerName) { return getHeader(headerName.toString()); }
+      public String getTrailer(String trailerName) { throw new UnsupportedOperationException(); }
+      public MultiMap trailers() { throw new UnsupportedOperationException(); }
+      public List<String> cookies() { throw new UnsupportedOperationException(); }
+      public HttpClientResponse customFrameHandler(Handler<HttpFrame> handler) { throw new UnsupportedOperationException(); }
+      public NetSocket netSocket() { throw new UnsupportedOperationException(); }
+      public HttpClientRequest request() { return req; }
+      public HttpClientResponse streamPriorityHandler(Handler<StreamPriority> handler) { return this; }
+      public Future<Buffer> body() { throw new UnsupportedOperationException(); }
+      public Future<Void> end() { throw new UnsupportedOperationException(); }
+    }
+    MockResp resp = new MockResp();
+    Function<HttpClientResponse, Future<RequestOptions>> handler = HttpClientAgent.DEFAULT_REDIRECT_HANDLER;
+    Future<RequestOptions> redirection = handler.apply(resp);
+    if (expectedAbsoluteURI != null) {
+      RequestOptions expectedOptions = new RequestOptions().setAbsoluteURI(location);
+      assertEquals(expectedOptions.getHost(), redirection.result().getHost());
+      assertEquals(expectedOptions.getPort(), redirection.result().getPort());
+      assertEquals(expectedOptions.getURI(), redirection.result().getURI());
+      assertEquals(expectedOptions.isSsl(), redirection.result().isSsl());
+    } else {
+      assertTrue(redirection == null || redirection.failed() || redirection.result().getHost() == null);
+    }
+  }
+
+  @Test
+  public void testFollowRedirectEncodedParams() throws Exception {
+    assumeTrue(testAddress.isInetSocket());
+    String value1 = "\ud55c\uae00", value2 = "A B+C", value3 = "123 \u20ac";
+    server.requestHandler(req -> {
+      switch (req.path()) {
+        case "/first/call/from/client":
+          StringBuilder location = null;
+          try {
+            location = new StringBuilder()
+              .append(req.scheme()).append("://").append(config.host()).append(':').append(config.port())
+              .append("/redirected/from/client?")
+              .append("encoded1=").append(URLEncoder.encode(value1, "UTF-8")).append('&')
+              .append("encoded2=").append(URLEncoder.encode(value2, "UTF-8")).append('&')
+              .append("encoded3=").append(URLEncoder.encode(value3, "UTF-8"));
+          } catch (UnsupportedEncodingException e) {
+            Assert.fail(e.getMessage());
+          }
+          req.response()
+            .setStatusCode(302)
+            .putHeader("location", location.toString())
+            .send();
+          break;
+        case "/redirected/from/client":
+          assertEquals(value1, req.params().get("encoded1"));
+          assertEquals(value2, req.params().get("encoded2"));
+          assertEquals(value3, req.params().get("encoded3"));
+          req.response().end();
+          break;
+        default:
+          Assert.fail("Unknown path: " + req.path());
+      }
+    });
+    startServer(testAddress);
+
+    client.request(new RequestOptions(requestOptions).setURI("/first/call/from/client"))
+      .compose(req -> req
+        .setFollowRedirects(true)
+        .send()
+        .expecting(HttpResponseExpectation.SC_OK))
+      .await();
+  }
+
+  @Test
+  public void testFollowRedirectHandlerDefaultHeaderFilteringSameOrigin() throws Exception {
+    JsonObject result = testFollowRedirectHandlerHeaderFilteringSameOrigin(
+      config
+        .forClient(),
+      new RequestOptions()
+        .putHeader(HttpHeaders.AUTHORIZATION, "secret")
+        .putHeader(HttpHeaders.COOKIE, "secret")
+        .putHeader(HttpHeaders.PROXY_AUTHORIZATION, "secret")
+        .putHeader("test", "test")
+    );
+    assertEquals("secret", result.getString(HttpHeaders.AUTHORIZATION.toString()));
+    assertNull(result.getString(HttpHeaders.COOKIE.toString()));
+    assertEquals("secret", result.getString(HttpHeaders.PROXY_AUTHORIZATION.toString()));
+    assertEquals("test", result.getString("test"));
+  }
+
+  @Test
+  public void testFollowRedirectHandlerHeaderFilteringSameOrigin() throws Exception {
+    JsonObject result = testFollowRedirectHandlerHeaderFilteringSameOrigin(
+      config
+        .forClient()
+        .setSameOriginRedirectBlockedHeaders(Set.of("test")),
+      new RequestOptions()
+        .putHeader(HttpHeaders.AUTHORIZATION, "secret")
+        .putHeader(HttpHeaders.COOKIE, "secret")
+        .putHeader(HttpHeaders.PROXY_AUTHORIZATION, "secret")
+        .putHeader("test", "test")
+    );
+    assertEquals("secret", result.getString(HttpHeaders.AUTHORIZATION.toString()));
+    assertEquals("secret", result.getString(HttpHeaders.COOKIE.toString()));
+    assertEquals("secret", result.getString(HttpHeaders.PROXY_AUTHORIZATION.toString()));
+    assertNull(result.getString("test"));
+  }
+
+  private JsonObject testFollowRedirectHandlerHeaderFilteringSameOrigin(HttpClientConfigurator configurator, RequestOptions request) throws Exception {
+    String scheme = config.version() == HttpVersion.HTTP_1_1 ? "http" : "https";
+    request
+      .setHost("localhost")
+      .setPort(DEFAULT_HTTP_PORT);
+    client.close();
+    client = configurator
+      .configureSsl(options -> options.setHostnameVerificationAlgorithm(""))
+      .create(vertx);
+    return testFollowRedirectHandlerHeaderFiltering(
+      request,
+      scheme + "://localhost:" + DEFAULT_HTTP_PORT,
+      inetSocketAddress(DEFAULT_HTTP_PORT, DEFAULT_HTTP_HOST));
+  }
+
+  @WithDnsServer(records = { @DnsRecord(name = "host1.com"), @DnsRecord(name = "host2.com") })
+  @Test
+  public void testFollowRedirectHandlerDefaultHeaderFilteringDifferentHost() throws Exception {
+    JsonObject result = testFollowRedirectHandlerHeaderFilteringDifferentHost(
+      config
+        .forClient(),
+      new RequestOptions()
+        .putHeader(HttpHeaders.AUTHORIZATION, "secret")
+        .putHeader(HttpHeaders.COOKIE, "secret")
+        .putHeader(HttpHeaders.PROXY_AUTHORIZATION, "secret")
+        .putHeader("test", "test")
+    );
+    assertNull(result.getString(HttpHeaders.AUTHORIZATION.toString()));
+    assertNull(result.getString(HttpHeaders.COOKIE.toString()));
+    assertNull(result.getString(HttpHeaders.PROXY_AUTHORIZATION.toString()));
+    assertEquals("test", result.getString("test"));
+  }
+
+  @WithDnsServer(records = { @DnsRecord(name = "host1.com"), @DnsRecord(name = "host2.com") })
+  @Test
+  public void testFollowRedirectHandlerHeaderFilteringDifferentHost() throws Exception {
+    JsonObject result = testFollowRedirectHandlerHeaderFilteringDifferentHost(
+      config
+        .forClient()
+        .setCrossOriginRedirectBlockedHeaders(Set.of("test")),
+      new RequestOptions()
+        .putHeader(HttpHeaders.AUTHORIZATION, "secret")
+        .putHeader(HttpHeaders.COOKIE, "secret")
+        .putHeader(HttpHeaders.PROXY_AUTHORIZATION, "secret")
+        .putHeader("test", "test")
+    );
+    assertEquals("secret", result.getString(HttpHeaders.AUTHORIZATION.toString()));
+    assertEquals("secret", result.getString(HttpHeaders.COOKIE.toString()));
+    assertEquals("secret", result.getString(HttpHeaders.PROXY_AUTHORIZATION.toString()));
+    assertNull(result.getString("test"));
+  }
+
+  private JsonObject testFollowRedirectHandlerHeaderFilteringDifferentHost(HttpClientConfigurator configurator, RequestOptions request) throws Exception {
+    String scheme = config.version() == HttpVersion.HTTP_1_1 ? "http" : "https";
+    request
+      .setHost("host1.com")
+      .setPort(DEFAULT_HTTP_PORT);
+    client.close();
+    client = configurator
+      .configureSsl(options -> options.setHostnameVerificationAlgorithm(""))
+      .create(vertx);
+    return testFollowRedirectHandlerHeaderFiltering(
+      request,
+      scheme + "://host2.com:" + DEFAULT_HTTP_PORT,
+      inetSocketAddress(DEFAULT_HTTP_PORT, DEFAULT_HTTP_HOST));
+  }
+
+  @Test
+  public void testFollowRedirectHandlerHeaderFilteringDifferentPort() throws Exception {
+    String scheme = config.version() == HttpVersion.HTTP_1_1 ? "http" : "https";
+    RequestOptions request = new RequestOptions()
+      .setHost(DEFAULT_HTTP_HOST)
+      .setPort(DEFAULT_HTTP_PORT)
+      .putHeader(HttpHeaders.AUTHORIZATION, "secret")
+      .putHeader(HttpHeaders.COOKIE, "secret")
+      .putHeader(HttpHeaders.PROXY_AUTHORIZATION, "secret");
+    JsonObject body = testFollowRedirectHandlerHeaderFiltering(
+      request,
+      scheme + "://" + DEFAULT_HTTPS_HOST + ":" + (DEFAULT_HTTP_PORT + 1),
+      inetSocketAddress(DEFAULT_HTTP_PORT, DEFAULT_HTTP_HOST),
+      inetSocketAddress(DEFAULT_HTTP_PORT + 1, DEFAULT_HTTP_HOST));
+    assertNull(body.getString(HttpHeaders.AUTHORIZATION.toString()));
+    assertNull(body.getString(HttpHeaders.COOKIE.toString()));
+    assertNull(body.getString(HttpHeaders.PROXY_AUTHORIZATION.toString()));
+  }
+
+  @Test
+  public void testFollowRedirectHandlerHeaderFilteringDifferentScheme() throws Exception {
+
+    Assume.assumeTrue(config.version() == HttpVersion.HTTP_1_1);
+
+    Origin dst = new Origin("https", DEFAULT_HTTP_HOST, DEFAULT_HTTP_PORT);
+
+    // This proxy allows to test two consecutive to the same authority with both SSL and non SSL
+    NetServer proxy = vertx
+      .createNetServer()
+      .connectHandler(new Handler<NetSocket>() {
+        NetClient client = vertx.createNetClient();
+        int count = 0;
+        @Override
+        public void handle(NetSocket inbound) {
+          int val = count++;
+          switch (val) {
+            case 0:
+              proxy(inbound);
+              break;
+            case 1:
+              inbound
+                .upgradeToSsl(new ServerSSLOptions().setKeyCertOptions(Cert.SERVER_JKS.get()))
+                .onComplete(TestUtils.onSuccess(v -> {
+                  proxy(inbound);
+                }));
+              break;
+            default:
+              inbound.close();
+              break;
+          }
+        }
+        void proxy(NetSocket inbound) {
+          inbound.pause();
+          client.connect(DEFAULT_HTTP_PORT + 1, DEFAULT_HTTP_HOST)
+            .onComplete(ar -> {
+              if (ar.succeeded()) {
+                NetSocket outbound = ar.result();
+                inbound.handler(outbound::write);
+                inbound.endHandler(v -> outbound.end());
+                outbound.handler(inbound::write);
+                outbound.endHandler(v -> inbound.end());
+                inbound.resume();
+              } else {
+                inbound.close();
+              }
+            });
+        }
+      });
+    proxy.listen(DEFAULT_HTTP_PORT, DEFAULT_HTTP_HOST).await();
+
+    client.close();
+    client = config
+      .forClient()
+      .configureSsl(options -> {
+      options.setTrustAll(true);
+    }).create(vertx);
+
+    RequestOptions request = new RequestOptions()
+      .setHost(DEFAULT_HTTP_HOST)
+      .setPort(DEFAULT_HTTP_PORT)
+      .putHeader(HttpHeaders.AUTHORIZATION, "secret")
+      .putHeader(HttpHeaders.COOKIE, "secret")
+      .putHeader(HttpHeaders.PROXY_AUTHORIZATION, "secret");
+
+    JsonObject body = testFollowRedirectHandlerHeaderFiltering(request, dst.toASCII().toString(), inetSocketAddress(DEFAULT_HTTP_PORT + 1, DEFAULT_HTTP_HOST));
+    assertNull(body.getString(HttpHeaders.AUTHORIZATION.toString()));
+    assertNull(body.getString(HttpHeaders.COOKIE.toString()));
+    assertNull(body.getString(HttpHeaders.PROXY_AUTHORIZATION.toString()));
+  }
+
+  public JsonObject testFollowRedirectHandlerHeaderFiltering(RequestOptions request,
+                                                             String location,
+                                                             SocketAddress... bindings) throws Exception {
+
+    Handler<HttpServerRequest> requestHandler = new Handler<>() {
+      int count = 0;
+      @Override
+      public void handle(HttpServerRequest request) {
+        switch (count++) {
+          case 0:
+            request
+              .response()
+              .putHeader(HttpHeaders.LOCATION, location)
+              .setStatusCode(302)
+              .end();
+            break;
+          case 1:
+            MultiMap headers = request.headers();
+            JsonObject body = new JsonObject();
+            headers.forEach(body::put);
+            request.response().end(body.encode());
+            break;
+          default:
+            request.response().setStatusCode(500).end();
+            break;
+        }
+      }
+    };
+
+    for (SocketAddress binding : bindings) {
+      HttpServer server = createHttpServer()
+        .requestHandler(requestHandler);
+      server.listen(binding).await();
+    }
+
+    return client.request(request)
+      .compose(req -> req
+        .setFollowRedirects(true)
+        .send()
+        .expecting(HttpResponseExpectation.SC_OK)
+        .compose(HttpClientResponse::body).map(Buffer::toJsonObject))
+      .await();
+  }
+
+  @Test
+  public void testUseResponseAfterClose(Checkpoint checkpoint) throws Exception {
+    testAfterServerResponseClose(resp -> {
+      Buffer buff = Buffer.buffer();
+      resp.drainHandler(v -> {});
+      resp.exceptionHandler(v -> {});
+      resp.setChunked(false);
+      resp.setWriteQueueMaxSize(123);
+      resp.writeQueueFull();
+      resp.putHeader("foo", "bar");
+      resp.setChunked(true);
+      resp.write(buff);
+      resp.write("foo");
+      resp.write("foo", "UTF-8");
+      resp.write(buff).onComplete(TestUtils.onFailure(err1 -> {
+        resp.write("foo").onComplete(TestUtils.onFailure( err2 -> {
+          resp.write("foo", "UTF-8").onComplete(TestUtils.onFailure(err3 -> {
+            resp.end().onComplete(TestUtils.onFailure(err4 -> {
+              checkpoint.succeed();
+            }));
+          }));
+        }));
+      }));
+    });
+  }
+
+  @Test
+  public void testSendFileAfterServerResponseClose(Checkpoint checkpoint) throws Exception {
+    testAfterServerResponseClose(resp -> {
+      resp.sendFile("webroot/somefile.html");
+      checkpoint.succeed();
+    });
+  }
+
+  @Test
+  public void testSendFileAsyncAfterServerResponseClose(Checkpoint checkpoint) throws Exception {
+    testAfterServerResponseClose(resp -> {
+      resp.sendFile("webroot/somefile.html").onComplete(TestUtils.onFailure(err -> {
+        checkpoint.succeed();
+      }));
+    });
+  }
+
+  private void testAfterServerResponseClose(Handler<HttpServerResponse> test) throws Exception {
+    AtomicReference<HttpConnection> clientConn = new AtomicReference<>();
+    server.requestHandler(req -> {
+      HttpServerResponse resp = req.response();
+      resp.closeHandler(v1 -> {
+        test.handle(resp);
+      });
+      clientConn.get().close();
+    });
+    startServer(testAddress);
+    client = httpClientBuilder()
+      .withConnectHandler(clientConn::set)
+      .build();
+    Future<HttpClientRequest> request = client.request(requestOptions);
+    request.await();
+    request.compose(HttpClientRequest::send).onComplete(TestUtils.onFailure(err -> {
+    }));
+  }
+
+  @Test
+  public void testCloseHandlerCalledOnceInvariantWhenConnectionEndsEventLoop(Checkpoint checkpoint) throws Exception {
+    testCloseHandlerCalledOnceInvariantWhenConnectionEnds(ThreadingModel.EVENT_LOOP, checkpoint);
+  }
+
+  @Test
+  public void testCloseHandlerCalledOnceInvariantWhenConnectionEndsWorker(Checkpoint checkpoint) throws Exception {
+    testCloseHandlerCalledOnceInvariantWhenConnectionEnds(ThreadingModel.WORKER, checkpoint);
+  }
+
+  private void testCloseHandlerCalledOnceInvariantWhenConnectionEnds(ThreadingModel threadingModel, Checkpoint checkpoint) throws Exception {
+    server.requestHandler(req -> {
+      Context ctx = Vertx.currentContext();
+      req.response().closeHandler(v -> {
+        assertOnContext(ctx);
+        checkpoint.succeed();
+      });
+      req.response().setChunked(true).write("some-data");
+    });
+    startServer(testAddress, ((VertxInternal) vertx).createContext(threadingModel));
+    client.request(requestOptions)
+      .onComplete(TestUtils.onSuccess(req -> {
+        req.send().onComplete(TestUtils.onSuccess(resp -> {
+          resp.handler(v -> {
+            resp.request().connection().close();
+          });
+        }));
+      }));
+  }
+
+  @Test
+  public void testCloseHandlerCalledOnceInvariantWhenConnectionClosedAfterEnd(Checkpoint checkpoint) throws Exception {
+    AtomicInteger closeCount = new AtomicInteger();
+    AtomicInteger endCount = new AtomicInteger();
+    server.requestHandler(req -> {
+      req.response().closeHandler(v -> {
+        closeCount.incrementAndGet();
+      });
+      req.response().endHandler(v -> {
+        endCount.incrementAndGet();
+      });
+      req.connection().closeHandler(v -> {
+        assertEquals(1, closeCount.get());
+        assertEquals(1, endCount.get());
+        checkpoint.succeed();
+      });
+      req.response().end("some-data");
+    });
+    startServer(testAddress);
+    client.request(requestOptions).onComplete(TestUtils.onSuccess(req -> {
+      req.send().onComplete(TestUtils.onSuccess(resp -> {
+        resp.endHandler(v -> {
+          resp.request().connection().close();
+        });
+      }));
+    }));
+  }
+
+  @Test
+  public void testCloseHandlerCalledOnceInvariantWhenResponseEndsBeforeRequest(Checkpoint checkpoint) throws Exception {
+    AtomicInteger closeCount = new AtomicInteger();
+    server.requestHandler(req -> {
+      req.response().closeHandler(v -> {
+        assertEquals(1, closeCount.incrementAndGet());
+        assertTrue(req.isEnded());
+        assertTrue(req.response().ended());
+        req.connection().close();
+      });
+      req.connection().closeHandler(v -> {
+        assertEquals(1, closeCount.get());
+        checkpoint.succeed();
+      });
+      req.response().end();
+    });
+    startServer(testAddress);
+    client.request(new RequestOptions(requestOptions).setMethod(HttpMethod.PUT))
+      .compose(req -> req.write("chunk")
+        .compose(v -> req.response())
+        .compose(HttpClientResponse::end)
+        .compose(v -> req.end()))
+      .await();
+  }
+
+  @Test
+  public void testCloseNeverOvertakesDataInvariantOnWorker(Checkpoint checkpoint, Checkpoint firstChunkReceived, Checkpoint connectionClosed) throws Exception {
+    List<String> events = Collections.synchronizedList(new ArrayList<>());
+    server.requestHandler(req -> {
+      req.connection().closeHandler(v -> connectionClosed.succeed());
+      req.handler(chunk -> {
+        events.add("data");
+        if (events.size() == 1) {
+          firstChunkReceived.succeed();
+          connectionClosed.await(Duration.ofSeconds(2));
+        }
+      });
+      req.endHandler(v -> events.add("end"));
+      req.response().closeHandler(v -> {
+        events.add("close");
+        vertx.setTimer(100, id -> {
+          assertEquals("data", events.get(0));
+          assertEquals(1, Collections.frequency(events, "close"));
+          assertEquals(events.size() - 1, events.indexOf("close"));
+          checkpoint.succeed();
+        });
+      });
+    });
+    startServer(testAddress, ((VertxInternal) vertx).createWorkerContext());
+    HttpClientRequest request = client.request(new RequestOptions(requestOptions).setMethod(HttpMethod.PUT)).await();
+    request.write("chunk-1").await();
+    firstChunkReceived.awaitSuccess();
+    request.end("chunk-2").await();
+    request.connection().close().await();
+  }
+
+  @Test
+  public void testExceptionHandlerInvariantWhenConnectionClosedBeforeEndEventLoop(Checkpoint checkpoint1, Checkpoint checkpoint2,
+                                                                                  Checkpoint checkpoint3, Checkpoint checkpoint4) throws Exception {
+    testExceptionHandlerInvariantWhenConnectionClosedBeforeEnd(ThreadingModel.EVENT_LOOP, checkpoint1, checkpoint2,
+      checkpoint3, checkpoint4);
+  }
+
+  @Test
+  public void testExceptionHandlerInvariantWhenConnectionClosedBeforeEndWorker(Checkpoint checkpoint1, Checkpoint checkpoint2,
+                                                                               Checkpoint checkpoint3, Checkpoint checkpoint4) throws Exception {
+    testExceptionHandlerInvariantWhenConnectionClosedBeforeEnd(ThreadingModel.WORKER, checkpoint1, checkpoint2,
+      checkpoint3, checkpoint4);
+  }
+
+  private void testExceptionHandlerInvariantWhenConnectionClosedBeforeEnd(ThreadingModel threadingModel,
+                                                                          Checkpoint checkpoint1,
+                                                                          Checkpoint checkpoint2,
+                                                                          Checkpoint checkpoint3,
+                                                                          Checkpoint checkpoint4) throws Exception {
+    AtomicInteger requestCount = new AtomicInteger();
+    server.requestHandler(req -> {
+      Context ctx = Vertx.currentContext();
+      HttpServerResponse resp = req.response();
+      AtomicInteger requestExceptionHandlerCount = new AtomicInteger();
+      req.exceptionHandler(err -> {
+        if (err instanceof HttpClosedException) {
+          assertOnContext(ctx);
+          assertEquals(1, requestExceptionHandlerCount.incrementAndGet());
+          checkpoint1.succeed();
+        }
+      });
+      AtomicInteger responseExceptionHandlerCount = new AtomicInteger();
+      resp.exceptionHandler(err -> {
+        if (err instanceof HttpClosedException) {
+          assertOnContext(ctx);
+          assertEquals(1, responseExceptionHandlerCount.incrementAndGet());
+          checkpoint2.succeed();
+        }
+      });
+      resp.endHandler(v -> {
+        Assert.fail();
+      });
+      resp.closeHandler(v -> {
+        assertOnContext(ctx);
+        checkpoint3.succeed();
+      });
+      AtomicInteger closeHandlerCount = new AtomicInteger();
+      req.connection().closeHandler(v -> {
+        assertEquals(1, closeHandlerCount.incrementAndGet());
+        checkpoint4.succeed();
+      });
+      requestCount.incrementAndGet();
+    });
+
+    startServer(testAddress, ((VertxInternal) vertx).createContext(threadingModel));
+
+    HttpClientRequest request = client.request(new RequestOptions(requestOptions).setMethod(PUT)).await();
+    request.writeHead().await();
+    assertWaitUntil(() -> requestCount.get() > 0);
+    HttpConnection connection = request.connection();
+    connection.close().await();
+  }
+
+  @Test
+  public void testExceptionHandlerInvariantNotCalledAfterCompletion(Checkpoint checkpoint) throws Exception {
+    server.requestHandler(req -> {
+      HttpServerResponse resp = req.response();
+      req.exceptionHandler(err -> Assert.fail(err.getMessage()));
+      resp.exceptionHandler(err -> {
+        Assert.fail(err.getMessage());
+      });
+      resp.end();
+    });
+    startServer(testAddress);
+    client.request(requestOptions).onComplete(TestUtils.onSuccess(req -> {
+      req
+        .exceptionHandler(t -> {
+          Assert.fail("Should not be called");
+        })
+        .send().onComplete(TestUtils.onSuccess(resp -> {
+          resp.endHandler(v -> {
+            resp.request().connection().close();
+            vertx
+              .timer(100)
+              .onComplete(checkpoint);
+          });
+          resp.exceptionHandler(t -> {
+            Assert.fail("Should not be called");
+          });
+        }));
+    }));
+  }
+
+  @Test
+  public void testExceptionHandlerInvariantWhenConnectionClosedDuringResponse(Checkpoint checkpoint) throws Exception {
+    AtomicInteger responseExceptions = new AtomicInteger();
+    server.requestHandler(req -> {
+      req.exceptionHandler(err -> Assert.fail(err.getMessage()));
+      req.response().exceptionHandler(err -> {
+        assertTrue(err instanceof HttpClosedException);
+        assertEquals(1, responseExceptions.incrementAndGet());
+        vertx.timer(100).onComplete(checkpoint);
+      });
+      req.endHandler(v -> req.response().setChunked(true).write("chunk"));
+    });
+    startServer(testAddress);
+    client.request(requestOptions)
+      .onComplete(TestUtils.onSuccess(req -> {
+        req.send().onComplete(TestUtils.onSuccess(resp -> {
+          resp.handler(chunk -> {
+            resp.request().connection().close();
+          });
+        }));
+      }));
+  }
+
+  @Test
+  public void testCallbacksNotHoldingLockInvariant(Checkpoint checkpoint1, Checkpoint checkpoint2) throws Exception {
+    server.requestHandler(req -> {
+      HttpConnection conn = req.connection();
+      HttpServerResponse response = req.response();
+      response.headersEndHandler(v -> {
+        assertFalse(Thread.holdsLock(conn));
+      });
+      response.bodyEndHandler(v -> {
+        assertFalse(Thread.holdsLock(conn));
+      });
+      response.endHandler(v -> {
+        assertFalse(Thread.holdsLock(conn));
+      });
+      response.closeHandler(v -> {
+        assertFalse(Thread.holdsLock(conn));
+      });
+      switch (req.path()) {
+        case "/0":
+          req.handler(chunk -> {
+            assertFalse(Thread.holdsLock(conn));
+          });
+          req.endHandler(v -> {
+            assertFalse(Thread.holdsLock(conn));
+            req.response().end(TestUtils.randomAlphaString(256));
+          });
+          break;
+        case "/1":
+          AtomicBoolean paused = new AtomicBoolean();
+          req.pause();
+          paused.set(true);
+          vertx.runOnContext(v -> {
+            paused.set(false);
+            req.resume();
+          });
+          req.handler(chunk -> {
+            assertFalse(Thread.holdsLock(conn));
+            assertFalse(paused.get());
+            paused.set(true);
+            req.pause();
+            vertx.runOnContext(v -> {
+              paused.set(false);
+              req.resume();
+            });
+          });
+          req.endHandler(v -> {
+            assertFalse(Thread.holdsLock(conn));
+            assertFalse(paused.get());
+            req.response().end(TestUtils.randomAlphaString(256));
+          });
+          break;
+      }
+    });
+    startServer(testAddress);
+    for (int i = 0;i < 2;i++) {
+      Buffer body = Buffer.buffer(randomAlphaString(256));
+      client.request(new RequestOptions(requestOptions).setMethod(HttpMethod.POST).setURI("/" + i))
+        .onComplete(TestUtils.onSuccess(req -> req.send(body).onComplete(TestUtils.onSuccess(resp -> {
+          assertEquals(200, resp.statusCode());
+          HttpConnection conn = resp.request().connection();
+          switch (resp.request().path()) {
+            case "/0":
+              resp.handler(chunk -> {
+                assertFalse(Thread.holdsLock(conn));
+              });
+              resp.endHandler(v -> {
+                assertFalse(Thread.holdsLock(conn));
+                checkpoint1.succeed();
+              });
+              break;
+            case "/1":
+              AtomicBoolean paused = new AtomicBoolean();
+              resp.pause();
+              paused.set(true);
+              vertx.runOnContext(v -> {
+                paused.set(false);
+                resp.resume();
+              });
+              resp.handler(chunk -> {
+                assertFalse(Thread.holdsLock(conn));
+                assertFalse(paused.get());
+                paused.set(true);
+                resp.pause();
+                vertx.runOnContext(v -> {
+                  paused.set(false);
+                  resp.resume();
+                });
+              });
+              resp.endHandler(v -> {
+                assertFalse(Thread.holdsLock(conn));
+                assertFalse(paused.get());
+                checkpoint2.succeed();
+              });
+              break;
+          }
+        }))));
+    }
+  }
+
+  @Test
+  public void testCallbacksNotHoldingLockInvariantOnClose(Checkpoint checkpoint) throws Exception {
+    CountDownLatch latch = checkpoint.asLatch(7);
+    server.requestHandler(req -> {
+      HttpConnection conn = req.connection();
+      req.exceptionHandler(atMostOnce(err -> {
+        assertFalse(Thread.holdsLock(conn));
+        latch.countDown();
+      }));
+      HttpServerResponse resp = req.response();
+      resp.exceptionHandler(atMostOnce(err -> {
+        assertFalse(Thread.holdsLock(conn));
+        latch.countDown();
+      }));
+      resp.closeHandler(v -> {
+        assertFalse(Thread.holdsLock(conn));
+        latch.countDown();
+      });
+      conn.closeHandler(err -> {
+        assertFalse(Thread.holdsLock(conn));
+        latch.countDown();
+      });
+      resp.setChunked(true).write("hello");
+    });
+    startServer(testAddress);
+    client.request(new RequestOptions(requestOptions).setMethod(HttpMethod.PUT))
+      .onComplete(TestUtils.onSuccess(req -> {
+        req.response().onComplete(TestUtils.onSuccess(resp -> {
+          assertEquals(200, resp.statusCode());
+          HttpConnection conn = resp.request().connection();
+          resp.exceptionHandler(atMostOnce(err -> {
+            assertFalse(Thread.holdsLock(conn));
+            latch.countDown();
+          }));
+          conn.closeHandler(v -> {
+            assertFalse(Thread.holdsLock(conn));
+            latch.countDown();
+          });
+          conn.close();
+        }));
+        req.exceptionHandler(atMostOnce(err -> {
+          assertFalse(Thread.holdsLock(req.connection()));
+          latch.countDown();
+        }));
+        req.setChunked(true).writeHead();
+      }));
+  }
+
+  @Test
+  public void testClientDecompressionError() throws Exception {
+    server.requestHandler(req -> {
+      req.response()
+        .putHeader("Content-Encoding", "gzip")
+        .end("long response with mismatched encoding causes connection leaks");
+    });
+    startServer(testAddress);
+    client = config.forClient().setDecompressionSupported(true).create(vertx);
+    AbstractThrowableAssert<?, ? extends Throwable> assertion = assertThatThrownBy(() -> {
+      client.request(requestOptions)
+        .compose(req -> req.send().compose(HttpClientResponse::body))
+        .await();
+    }).isInstanceOfAny(Http2Exception.class, DecompressionException.class);
+  }
+
+  @Test
+  public void testContainsValueString() throws Exception {
+    server.requestHandler(req -> {
+      assertTrue(req.headers().contains("Foo", "foo", false));
+      assertFalse(req.headers().contains("Foo", "fOo", false));
+      req.response().putHeader("quux", "quux");
+      req.response().end();
+    });
+    startServer(testAddress);
+    MultiMap headers = client.request(requestOptions)
+      .compose(req -> req.putHeader("foo", "foo")
+        .send()
+        .map(HttpResponseHead::headers))
+      .await();
+    assertTrue(headers.contains("Quux", "quux", false));
+    assertFalse(headers.contains("Quux", "quUx", false));
+  }
+
+  @Test
+  public void testContainsValueStringIgnoreCase() throws Exception {
+    server.requestHandler(req -> {
+      assertTrue(req.headers().contains("Foo", "foo", true));
+      assertTrue(req.headers().contains("Foo", "fOo", true));
+      req.response().putHeader("quux", "quux");
+      req.response().end();
+    });
+    startServer(testAddress);
+    MultiMap headers = client.request(requestOptions)
+      .compose(req -> req.putHeader("foo", "foo").send()
+        .map(HttpResponseHead::headers))
+      .await();
+    assertTrue(headers.contains("Quux", "quux", true));
+    assertTrue(headers.contains("Quux", "quUx", true));
+  }
+
+  @Test
+  public void testContainsValueCharSequence() throws Exception {
+    CharSequence Foo = HttpHeaders.createOptimized("Foo");
+    CharSequence foo = HttpHeaders.createOptimized("foo");
+    CharSequence fOo = HttpHeaders.createOptimized("fOo");
+
+    CharSequence Quux = HttpHeaders.createOptimized("Quux");
+    CharSequence quux = HttpHeaders.createOptimized("quux");
+    CharSequence quUx = HttpHeaders.createOptimized("quUx");
+
+    server.requestHandler(req -> {
+      assertTrue(req.headers().contains(Foo, foo, false));
+      assertFalse(req.headers().contains(Foo, fOo, false));
+      req.response().putHeader(quux, quux);
+      req.response().end();
+    });
+    startServer(testAddress);
+    MultiMap headers = client.request(requestOptions)
+      .compose(req -> req.putHeader(foo, foo)
+        .send()
+        .map(HttpClientResponse::headers))
+      .await();
+    assertTrue(headers.contains(Quux, quux, false));
+    assertFalse(headers.contains(Quux, quUx, false));
+  }
+
+  @Test
+  public void testContainsValueCharSequenceIgnoreCase() throws Exception {
+    CharSequence Foo = HttpHeaders.createOptimized("Foo");
+    CharSequence foo = HttpHeaders.createOptimized("foo");
+    CharSequence fOo = HttpHeaders.createOptimized("fOo");
+
+    CharSequence Quux = HttpHeaders.createOptimized("Quux");
+    CharSequence quux = HttpHeaders.createOptimized("quux");
+    CharSequence quUx = HttpHeaders.createOptimized("quUx");
+
+    server.requestHandler(req -> {
+      assertTrue(req.headers().contains(Foo, foo, true));
+      assertTrue(req.headers().contains(Foo, fOo, true));
+      req.response().putHeader(quux, quux);
+      req.response().end();
+    });
+    startServer(testAddress);
+    MultiMap headers = client.request(requestOptions)
+      .compose(req -> req.putHeader(foo, foo)
+        .send()
+        .map(HttpClientResponse::headers))
+      .await();
+    assertTrue(headers.contains(Quux, quux, true));
+    assertTrue(headers.contains(Quux, quUx, true));
+  }
+
+  @Test
+  public void testBytesReadRequest() throws Exception {
+    int length = 2048;
+    Buffer expected = Buffer.buffer(TestUtils.randomAlphaString(length));;
+    server.requestHandler(req -> {
+      req.bodyHandler(buffer -> {
+        assertEquals(req.bytesRead(), length);
+        req.response().end();
+      });
+    });
+    startServer(testAddress);
+    client.request(new RequestOptions(requestOptions).setMethod(PUT))
+      .compose(req -> req
+        .send(expected)
+        .compose(HttpClientResponse::end))
+      .await();
+  }
+
+  @Test
+  public void testClientSynchronousConnectFailures(Checkpoint checkpoint) {
+    System.setProperty("vertx.disableDnsResolver", "true");
+    Vertx vertx = Vertx.vertx(new VertxOptions().setAddressResolverOptions(new AddressResolverOptions().setQueryTimeout(100)));
+    try {
+      int poolSize = 2;
+      client = createHttpClient(new HttpClientOptions(), new PoolOptions().setHttp1MaxSize(poolSize));
+      AtomicInteger failures = new AtomicInteger();
+      for (int i = 0; i < (poolSize + 1); i++) {
+        AtomicBoolean f = new AtomicBoolean();
+        client.request(new RequestOptions().setAbsoluteURI("http://invalid-host-name.foo.bar"))
+          .onComplete(TestUtils.onFailure(req -> {
+            if (f.compareAndSet(false, true)) {
+              if (failures.incrementAndGet() == poolSize + 1) {
+                checkpoint.succeed();
+              }
+            }
+          }));
+      }
+    } finally {
+      vertx.close();
+      System.setProperty("vertx.disableDnsResolver", "false");
+    }
+  }
+
+  @Test
+  public void testClientConnectInvalidPort() {
+    assertThatThrownBy(() -> {
+      client.request(new RequestOptions(requestOptions).setPort(-1));
+    }).isInstanceOf(IllegalArgumentException.class)
+      .message()
+      .isEqualTo("port p must be in range 0 <= p <= 65535");
+  }
+
+  protected static String generateQueryString(MultiMap params, char delim) {
+    StringBuilder sb = new StringBuilder();
+    int count = 0;
+    for (Map.Entry<String, String> param : params.entries()) {
+      sb.append(param.getKey()).append("=").append(param.getValue());
+      if (++count != params.size()) {
+        sb.append(delim);
+      }
+    }
+    return sb.toString();
+  }
+
+  @Test
+  public void testHttpClientRequestHeadersDontContainCROrLF(Checkpoint checkpoint) throws Exception {
+    server.requestHandler(req -> {
+      req.headers().forEach(header -> {
+        String name = header.getKey();
+        switch (name.toLowerCase()) {
+          case "host":
+          case ":method":
+          case ":path":
+          case ":scheme":
+          case ":authority":
+            break;
+          default:
+            Assert.fail("Unexpected header " + name);
+        }
+      });
+      checkpoint.succeed();
+    });
+    startServer(testAddress);
+    client.request(requestOptions).onComplete(TestUtils.onSuccess(req -> {
+      List<BiConsumer<String, String>> list = Arrays.asList(
+        req::putHeader,
+        req.headers()::set,
+        req.headers()::add
+      );
+      list.forEach(cs -> {
+        try {
+          req.putHeader("header-name: header-value\r\nanother-header", "another-value");
+          Assert.fail();
+        } catch (IllegalArgumentException e) {
+        }
+      });
+      assertEquals(0, req.headers().size());
+      req.end();
+    }));
+  }
+
+  @Test
+  public void testHttpServerResponseHeadersDontContainCROrLF() throws Exception {
+    server.requestHandler(req -> {
+      List<BiConsumer<String, String>> list = Arrays.asList(
+        req.response()::putHeader,
+        req.response().headers()::set,
+        req.response().headers()::add
+      );
+      list.forEach(cs -> {
+        try {
+          cs.accept("header-name: header-value\r\nanother-header", "another-value");
+          Assert.fail();
+        } catch (IllegalArgumentException e) {
+        }
+      });
+      assertEquals(Collections.emptySet(), req.response().headers().names());
+      req.response().end();
+    });
+    startServer(testAddress);
+    MultiMap headers = client.request(requestOptions).compose(request -> request
+        .send()
+        .map(HttpClientResponse::headers))
+      .await();
+    headers
+      .forEach(header -> {
+        String name = header.getKey();
+        if (name.equalsIgnoreCase("content-length")) {
+        } else {
+          fail("Unexpected header " + name);
+        }
+      });
+  }
+
+  @Test
+  public void testDisableIdleTimeoutInPool(Checkpoint checkpoint) throws Exception {
+    server.requestHandler(req -> {
+      req.response().end();
+    });
+    startServer(testAddress);
+    client = config.forClient().setIdleTimeout(Duration.ofSeconds(1)).setKeepAliveTimeout(Duration.ofSeconds(10)).create(vertx, new PoolOptions().setHttp1MaxSize(1));
+    client.request(requestOptions).onComplete(TestUtils.onSuccess(req -> {
+      req.send().onComplete(TestUtils.onSuccess(resp -> {
+        resp.endHandler(v1 -> {
+          AtomicBoolean closed = new AtomicBoolean();
+          resp.request().connection().closeHandler(v2 -> {
+            closed.set(true);
+          });
+          vertx.setTimer(2000, id -> {
+            assertFalse(closed.get());
+            checkpoint.succeed();
+          });
+        });
+      }));
+    }));
+  }
+
+  @Test
+  public void testKeepAliveTimeout(Checkpoint checkpoint) throws Exception {
+    server.requestHandler(req -> {
+      req.response().end();
+    });
+    HttpClientConfigurator options = config.forClient().setKeepAliveTimeout(Duration.ofSeconds(3));
+    testKeepAliveTimeout(checkpoint, options, new PoolOptions(), 1);
+  }
+
+  protected void testKeepAliveTimeout(Checkpoint checkpoint, HttpClientConfigurator options, PoolOptions poolOptions, int numReqs) throws Exception {
+    startServer(testAddress);
+    client = options.create(vertx, poolOptions.setCleanerPeriod(1));
+    AtomicInteger respCount = new AtomicInteger();
+    for (int i = 0;i < numReqs;i++) {
+      int current = 1 + i;
+      client.request(requestOptions)
+        .compose(HttpClientRequest::send)
+        .onComplete(TestUtils.onSuccess(resp -> {
+          respCount.incrementAndGet();
+          if (current == numReqs) {
+            long now = System.currentTimeMillis();
+            resp.request().connection().closeHandler(v -> {
+              long timeout = System.currentTimeMillis() - now;
+              int delta = 500;
+              int low = 3000 - delta;
+              int high = 3000 + delta;
+              assertTrue("Expected actual close timeout " + timeout + " to be > " + low, low < timeout);
+              assertTrue("Expected actual close timeout " + timeout + " + to be < " + high, timeout < high);
+              checkpoint.succeed();
+            });
+          }
+        }));
+    }
+  }
+
+  @Test
+  public void testPoolNotExpiring1(Checkpoint checkpoint) throws Exception {
+    testPoolNotExpiring(checkpoint, config.forClient().setKeepAliveTimeout(Duration.ofSeconds(100)), new PoolOptions().setCleanerPeriod(0));
+  }
+
+  @Test
+  public void testPoolNotExpiring2(Checkpoint checkpoint) throws Exception {
+    testPoolNotExpiring(checkpoint, config.forClient().setKeepAliveTimeout(Duration.ofSeconds(0)), new PoolOptions().setCleanerPeriod(10));
+  }
+
+  private void testPoolNotExpiring(Checkpoint checkpoint, HttpClientConfigurator options, PoolOptions poolOptions) throws Exception {
+    AtomicLong now = new AtomicLong();
+    server.requestHandler(req -> {
+      req.response().end();
+      now.set(System.currentTimeMillis());
+      vertx.setTimer(2000, id -> {
+        req.connection().close();
+      });
+    });
+    startServer(testAddress);
+    client = options.create(vertx, poolOptions);
+    client.request(requestOptions)
+      .onComplete(TestUtils.onSuccess(req -> req.send().onComplete(TestUtils.onSuccess(resp -> {
+        resp.endHandler(v1 -> {
+          resp.request().connection().closeHandler(v2 -> {
+            long time = System.currentTimeMillis() - now.get();
+            assertTrue("Was expecting " + time + " to be > 2000", time >= 2000);
+            checkpoint.succeed();
+          });
+        });
+      }))));
+  }
+
+  @Test
+  public void testMaxLifetime(Checkpoint checkpoint) throws Exception {
+
+    int poolCleanerPeriod = 100;
+    int maxLifetime = 3000;
+    server
+      .connectionHandler(conn -> {
+        long now = System.currentTimeMillis();
+        conn.closeHandler(v -> {
+          long lifetime = System.currentTimeMillis() - now;
+          int delta = 500;
+          int lowerBound = maxLifetime - poolCleanerPeriod - delta;
+          assertTrue("Was expecting connection to be closed in more than " + lowerBound + ": " + lifetime, lifetime >= lowerBound);
+          int upperBound = maxLifetime + poolCleanerPeriod + delta;
+          assertTrue("Was expecting connection to be closed in less than " + upperBound + ": " + lifetime, lifetime <= upperBound);
+          checkpoint.succeed();
+        });
+      })
+      .requestHandler(req -> {
+        req.response().end();
+      });
+    startServer(testAddress);
+
+    PoolOptions poolOptions = new PoolOptions()
+      .setCleanerPeriod(poolCleanerPeriod)
+      .setMaxLifetime(maxLifetime)
+      .setMaxLifetimeUnit(TimeUnit.MILLISECONDS);
+    client = createHttpClient(poolOptions);
+
+    // Create a connection that remains in the pool
+    client.request(requestOptions)
+      .compose(req -> req
+        .send()
+        .compose(HttpClientResponse::body))
+      .await();
+  }
+
+  @Test
+  public void testHttpConnect(Checkpoint checkpoint) {
+    testHttpConnect(checkpoint, new RequestOptions(requestOptions).setMethod(HttpMethod.CONNECT), 200);
+  }
+
+  protected void testHttpConnect(Checkpoint checkpoint, RequestOptions options, int sc) {
+    Buffer buffer = TestUtils.randomBuffer(128);
+    Buffer received = Buffer.buffer();
+    CompletableFuture<Void> closeSocket = new CompletableFuture<>();
+    NetServer netServer = vertx.createNetServer(new NetServerOptions().setPort(0).setHost("localhost"))
+      .connectHandler(socket -> {
+        socket.handler(socket::write);
+        closeSocket.thenAccept(v -> {
+          socket.close();
+        });
+      }).listen().await();
+    // Declare netClient in the main thread to avoid having it randomly garbage collected just after it created the connection
+    NetClient netClient = vertx.createNetClient(new NetClientOptions());
+
+    server.requestHandler(req -> {
+      netClient.connect(netServer.actualPort(), "localhost").onComplete(TestUtils.onSuccess(dst -> {
+
+        req.response().setStatusCode(sc);
+        req.response().setStatusMessage("Connection established");
+
+        // Now create a NetSocket
+        req.toNetSocket().onComplete(TestUtils.onSuccess(src -> {
+          // Create pumps which echo stuff
+          src.pipeTo(dst);
+          dst.pipeTo(src);
+        }));
+      }));
+    });
+    server.listen(testAddress).onComplete(TestUtils.onSuccess(s -> {
+      client.request(options).onComplete(TestUtils.onSuccess(req -> {
+        req
+          .connect().onComplete(TestUtils.onSuccess(resp -> {
+            assertEquals(sc, resp.statusCode());
+            NetSocket socket = resp.netSocket();
+            socket.handler(buff -> {
+              received.appendBuffer(buff);
+              if (received.length() == buffer.length()) {
+                closeSocket.complete(null);
+              }
+            });
+            socket.closeHandler(v -> {
+              assertEquals(ByteBufUtil.hexDump(buffer.getBytes()), ByteBufUtil.hexDump(received.getBytes()));
+              checkpoint.succeed();
+            });
+            socket.write(buffer);
+          }));
+      }));
+    }));
+  }
+
+  @Test
+  public void testNetSocketConnectSuccessClientInitiatesCloseImmediately(Checkpoint checkpoint1, Checkpoint checkpoint2) throws Exception {
+    testNetSocketConnectSuccess(so -> {
+      Buffer received = Buffer.buffer();
+      so.handler(received::appendBuffer);
+      so.endHandler(v -> {
+        assertEquals("hello", received.toString());
+        so.end();
+        checkpoint1.succeed();
+      });
+    }, so -> {
+      Buffer received = Buffer.buffer();
+      so.handler(received::appendBuffer);
+      so.endHandler(v -> {
+        assertEquals("", received.toString());
+        checkpoint2.succeed();
+      });
+      so.end(Buffer.buffer("hello"));
+    });
+  }
+
+  @Test
+  public void testNetSocketConnectSuccessServerInitiatesCloseImmediately(Checkpoint checkpoint1, Checkpoint checkpoint2) throws Exception {
+    testNetSocketConnectSuccess(so -> {
+      Buffer received = Buffer.buffer();
+      so.handler(received::appendBuffer);
+      so.endHandler(v -> {
+        assertEquals("", received.toString());
+        checkpoint1.succeed();
+      });
+      so.end(Buffer.buffer("hello"));
+    }, so -> {
+      Buffer received = Buffer.buffer();
+      so.handler(received::appendBuffer);
+      so.endHandler(v -> {
+        assertEquals("hello", received.toString());
+        so.end();
+        checkpoint2.succeed();
+      });
+    });
+  }
+
+  @Test
+  public void testNetSocketConnectSuccessServerInitiatesCloseOnReply(Checkpoint checkpoint1, Checkpoint checkpoint2) throws Exception {
+    testNetSocketConnectSuccess(so -> {
+      Buffer received = Buffer.buffer();
+      so.handler(received::appendBuffer);
+      so.endHandler(v -> {
+        assertEquals("pong", received.toString());
+        so.end();
+        checkpoint1.succeed();
+      });
+      so.write(Buffer.buffer("ping"));
+      }, so -> {
+      so.handler(buff -> {
+        if (buff.toString().equals("ping")) {
+          so.end(Buffer.buffer("pong"));
+        }
+      });
+      so.endHandler(v -> {
+        checkpoint2.succeed();
+      });
+    });
+  }
+
+  @Test
+  public void testNetSocketConnectSuccessClientInitiatesCloseOnReply(Checkpoint checkpoint1, Checkpoint checkpoint2) throws Exception {
+    testNetSocketConnectSuccess(so -> {
+      so.handler(buff -> {
+        if (buff.toString().equals("ping")) {
+          so.end(Buffer.buffer("pong"));
+        }
+      });
+      so.endHandler(v -> {
+        checkpoint1.succeed();
+      });
+    }, so -> {
+      Buffer received = Buffer.buffer();
+      so.handler(received::appendBuffer);
+      so.endHandler(v -> {
+        assertEquals("pong", received.toString());
+        so.end();
+        checkpoint2.succeed();
+      });
+      so.write(Buffer.buffer("ping"));
+    });
+  }
+
+  private void testNetSocketConnectSuccess(Handler<NetSocket> clientHandler, Handler<NetSocket> serverHandler) throws Exception {
+    server.requestHandler(req -> {
+      req.response().setStatusCode(101);
+      req.toNetSocket().onComplete(TestUtils.onSuccess(serverHandler::handle));
+    });
+    startServer(testAddress);
+    client.request(new RequestOptions(requestOptions).setMethod(HttpMethod.CONNECT))
+      .onComplete(TestUtils.onSuccess(req -> {
+      req.connect().onComplete(TestUtils.onSuccess(resp -> {
+        clientHandler.handle(resp.netSocket());
+      }));
+    }));
+  }
+
+  @Test
+  public void testClientNetSocketConnectReject() throws Exception {
+    server.requestHandler(req -> {
+      req.response().setStatusCode(404).end();
+    });
+
+    startServer(testAddress);
+    RequestOptions opts = new RequestOptions(requestOptions).setMethod(CONNECT);
+    client.request(opts)
+      .compose(req -> req
+        .connect()
+        .expecting(HttpResponseExpectation.SC_NOT_FOUND))
+      .await();
+  }
+
+  @Test
+  public void testClientNetSocketConnectFailure() throws Exception {
+    server.requestHandler(req -> {
+      req.connection().close();
+    });
+
+    startServer(testAddress);
+    RequestOptions opts = new RequestOptions(requestOptions).setMethod(CONNECT);
+    assertThatThrownBy(() -> {
+      client.request(opts)
+        .compose(HttpClientRequest::connect)
+        .await();
+    });
+  }
+
+  @Test
+  public void testAccessNetSocketPendingResponseDataPaused(Checkpoint checkpoint) throws Exception {
+    testAccessNetSocketPendingResponseData(checkpoint, true);
+  }
+
+  @Test
+  public void testAccessNetSocketPendingResponseDataNotPaused(Checkpoint checkpoint) throws Exception {
+    testAccessNetSocketPendingResponseData(checkpoint, false);
+  }
+
+  private void testAccessNetSocketPendingResponseData(Checkpoint checkpoint, boolean pause) throws Exception {
+    server.requestHandler(req -> {
+      req.toNetSocket().onComplete(TestUtils.onSuccess(so -> {
+        so.write("hello");
+      }));
+    });
+    startServer(testAddress);
+    client = createHttpClient();
+    client.request(new RequestOptions(requestOptions).setMethod(HttpMethod.CONNECT)).onComplete(TestUtils.onSuccess(req -> {
+      req.connect().onComplete(TestUtils.onSuccess(so -> {
+        assertNotNull(so);
+        so.handler(buff -> {
+          // With HTTP/1.1 the buffer is received immediately but delivered asynchronously
+          assertEquals("hello", buff.toString());
+          checkpoint.succeed();
+        });
+        if (pause) {
+          so.pause();
+          vertx.setTimer(100, id -> {
+            so.resume();
+          });
+        }
+      }));
+    }));
+  }
+
+  @Test
+  public void testServerNetSocketCloseWithHandler(Checkpoint checkpoint1, Checkpoint checkpoint2) throws Exception {
+    server.requestHandler(req -> {
+      req.toNetSocket().onComplete(TestUtils.onSuccess(so -> {
+        so.close().onComplete(checkpoint1);
+      }));
+    });
+    startServer(testAddress);
+    client = createHttpClient();
+    client.request(new RequestOptions(requestOptions).setMethod(HttpMethod.CONNECT)).onComplete(TestUtils.onSuccess(req -> {
+      req.connect().onComplete(TestUtils.onSuccess(resp -> {
+        NetSocket so = resp.netSocket();
+        so.closeHandler(v -> {
+          checkpoint2.succeed();
+        });
+      }));
+    }));
+  }
+
+  @Test
+  public void testClientNetSocketCloseWithHandler(Checkpoint checkpoint) throws Exception {
+    server.requestHandler(req -> {
+      req.toNetSocket().onComplete(TestUtils.onSuccess(so -> {
+        so.closeHandler(v -> {
+          checkpoint.succeed();
+        });
+      }));
+    });
+    startServer(testAddress);
+    RequestOptions opts = new RequestOptions(requestOptions).setMethod(CONNECT);
+    client.request(opts)
+      .compose(req -> req
+        .connect()
+        .map(HttpClientResponse::netSocket)
+        .compose(NetSocket::close))
+      .await();
+  }
+
+  @Test
+  public void testHttpInvalidConnectResponseEnded(Checkpoint checkpoint) throws Exception {
+    server.requestHandler(req -> {
+      req.response().end();
+      req.toNetSocket().onComplete(TestUtils.onFailure(err -> {
+        checkpoint.succeed();
+      }));
+    });
+    startServer(testAddress);
+    client.request(new RequestOptions(requestOptions).setMethod(HttpMethod.CONNECT))
+      .compose(req -> req
+        .send()
+        .expecting(HttpResponseExpectation.SC_OK))
+      .await();
+  }
+
+  @Test
+  public void testHttpInvalidConnectResponseChunked(Checkpoint checkpoint) throws Exception {
+    server.requestHandler(req -> {
+      req.response().setChunked(true).write("some-chunk");
+      req.toNetSocket().onComplete(TestUtils.onFailure(err -> {
+        checkpoint.succeed();
+      }));
+    });
+    startServer(testAddress);
+    client.request(new RequestOptions(requestOptions).setMethod(HttpMethod.CONNECT))
+      .compose(req -> req
+        .send()
+        .expecting(HttpResponseExpectation.SC_OK))
+      .await();
+  }
+
+  @Test
+  public void testUpgradeTunnelNoSwitch(Checkpoint checkpoint) throws Exception {
+    server.requestHandler(req -> {
+      HttpServerResponse resp = req.response();
+      resp.setChunked(true);
+      resp.write("chunk-1")
+        .compose(v -> resp.write("chunk-2"))
+        .compose(v -> resp.end("chunk-3"));
+    });
+
+    startServer(testAddress);
+
+    client.request(HttpMethod.GET, config.port(), config.host(), "/").onComplete(TestUtils.onSuccess(req -> {
+      req.connect().onComplete(TestUtils.onSuccess(resp -> {
+        assertEquals(200, resp.statusCode());
+        List<String> chunks = new ArrayList<>();
+        resp.handler(chunk -> {
+          chunks.add(chunk.toString());
+        });
+        resp.endHandler(v -> {
+          assertEquals(Arrays.asList("chunk-1", "chunk-2", "chunk-3"), chunks);
+          checkpoint.succeed();
+        });
+      }));
+    }));
+  }
+
+  @Test
+  public void testEndFromAnotherThread(Checkpoint checkpoint) throws Exception {
+    server.requestHandler(req -> {
+      req.response().endHandler(v -> {
+        checkpoint.succeed();
+      });
+      new Thread(() -> {
+        req.response().end();
+      }).start();
+    });
+    startServer(testAddress);
+    client.request(requestOptions)
+      .compose(req -> req
+        .send()
+        .expecting(HttpResponseExpectation.SC_OK))
+      .await();
+  }
+
+  @Test
+  public void testServerResponseWriteSuccess(Checkpoint checkpoint) throws Exception {
+    testServerResponseWriteSuccess(checkpoint, resp -> resp.write(TestUtils.randomBuffer(1024)));
+  }
+
+  @Test
+  public void testServerResponseEndSuccess(Checkpoint checkpoint) throws Exception {
+    testServerResponseWriteSuccess(checkpoint, resp -> resp.end(TestUtils.randomBuffer(1024)));
+  }
+
+  private void testServerResponseWriteSuccess(Checkpoint checkpoint, Function<HttpServerResponse, Future<Void>> op) throws Exception {
+    server.requestHandler(req -> {
+      HttpServerResponse resp = req.response();
+      resp.setChunked(true);
+      op.apply(resp).onComplete(checkpoint);
+    });
+    startServer(testAddress);
+    client.request(requestOptions)
+      .compose(req -> req
+        .send()
+        .expecting(HttpResponseExpectation.SC_OK))
+      .await();
+  }
+
+  @Test
+  public void testServerResponseWriteFailure(Checkpoint checkpoint) throws Exception {
+    server.requestHandler(req -> {
+      HttpServerResponse resp = req.response();
+      resp.setChunked(true);
+      Buffer chunk = randomBuffer(1024);
+      Runnable[] task = new Runnable[1];
+      task[0] = () -> {
+        resp.write(chunk).onComplete(ar1 -> {
+          if (ar1.succeeded()) {
+            task[0].run();
+          } else {
+            resp.end().onComplete(onFailure(ar2 -> {
+              checkpoint.succeed();
+            }));
+          }
+        });
+      };
+      task[0].run();
+    });
+    startServer(testAddress);
+    client.request(requestOptions)
+      .compose(req -> req
+        .send()
+        .compose(resp -> resp
+          .request()
+          .connection()
+          .close()))
+      .await();
+  }
+
+  @Test
+  public void testClientRequestWriteSuccess() throws Exception {
+    testClientRequestWriteSuccess(req -> {
+      req.setChunked(true);
+      Future<Void> fut = req.write(randomBuffer(1024));
+      req.end();
+      return fut;
+    });
+  }
+
+  @Test
+  public void testClientRequestEnd1Success() throws Exception {
+    testClientRequestWriteSuccess(req -> req.end(TestUtils.randomBuffer(1024)));
+  }
+
+  @Test
+  public void testClientRequestEnd2Success() throws Exception {
+    testClientRequestWriteSuccess(req -> req.end());
+  }
+
+  private void testClientRequestWriteSuccess(Function<HttpClientRequest, Future<Void>> op) throws Exception {
+    CompletableFuture<Void> fut = new CompletableFuture<>();
+    server.requestHandler(req -> {
+      fut.complete(null);
+      req.endHandler(v -> {
+        HttpServerResponse resp = req.response();
+        if (!resp.ended()) {
+          resp.end();
+        }
+      });
+    });
+    startServer(testAddress);
+    client.request(new RequestOptions(requestOptions).setMethod(HttpMethod.PUT))
+      .compose(req -> {
+        Future<Void> res = op.apply(req);
+        return res
+          .compose(v -> req.response())
+          .compose(HttpClientResponse::end);
+      });
+  }
+
+  @Test
+  public void testClientRequestLazyWriteSuccess() throws Exception {
+    testClientRequestLazyWriteSuccess(req -> req.write(TestUtils.randomBuffer(1024)));
+  }
+
+  @Test
+  public void testClientRequestLazyEndSuccess() throws Exception {
+    testClientRequestLazyWriteSuccess(resp -> resp.end(TestUtils.randomBuffer(1024)));
+  }
+
+  private void testClientRequestLazyWriteSuccess(Function<HttpClientRequest, Future<Void>> op) throws Exception {
+    server.requestHandler(req -> {
+      req.response().end();
+    });
+    startServer(testAddress);
+    client
+      .request(new RequestOptions(requestOptions).setMethod(HttpMethod.PUT))
+      .compose(req -> {
+        req.setChunked(true);
+        return op
+          .apply(req)
+          .compose(v -> req
+            .response()
+            .compose(HttpClientResponse::end));
+      })
+      .await();
+  }
+
+  @Test
+  public void testClientResponseWriteFailure(Checkpoint checkpoint) throws Exception {
+    server.requestHandler(req -> {
+      req.connection().close();
+    });
+    startServer(testAddress);
+    client.request(new RequestOptions(requestOptions).setMethod(HttpMethod.PUT)).onComplete(TestUtils.onSuccess(req -> {
+      req.setChunked(true);
+      Buffer chunk = randomBuffer(1024);
+      Handler<Void>[] task = new Handler[1];
+      task[0] = v -> {
+        req.write(chunk).onComplete(ar1 -> {
+          if (ar1.succeeded()) {
+            vertx.runOnContext(task[0]);
+          } else {
+            req.end().onComplete(ar2 -> {
+              checkpoint.succeed();
+            });
+          }
+        });
+      };
+      task[0].handle(null);
+    }));
+  }
+
+  @Test
+  public void testServerRequestBodyFuture() throws Exception {
+    Buffer expected = Buffer.buffer(TestUtils.randomAlphaString(1024));
+    server.requestHandler(req -> {
+      req.body().onComplete(TestUtils.onSuccess(body -> {
+        assertEquals(expected, body);
+        req.response().end();
+      }));
+    });
+    startServer(testAddress);
+    client.request(requestOptions)
+      .compose(req ->
+        req
+          .send(expected)
+          .compose(HttpClientResponse::end))
+      .await();
+  }
+
+  @Test
+  public void testServerRequestBodyFutureFail(Checkpoint checkpoint) throws Exception {
+    Buffer expected = Buffer.buffer(TestUtils.randomAlphaString(1024));
+    CompletableFuture<Void> latch = new CompletableFuture<>();
+    server.requestHandler(req -> {
+      req.body().onComplete(TestUtils.onFailure(err -> {
+        checkpoint.succeed();
+      }));
+      latch.complete(null);
+    });
+    startServer(testAddress);
+    client.request(requestOptions).onComplete(TestUtils.onSuccess(req -> {
+      req.setChunked(true);
+      latch.whenComplete((v, err) -> {
+        req.reset();
+      });
+      req.write(expected);
+    }));
+  }
+
+  @Test
+  public void testServerRequestFuturesRequestedAfterFailure(Checkpoint checkpoint1, Checkpoint checkpoint2) throws Exception {
+    testServerRequestFuturesRequestedAfterFailure(checkpoint1, checkpoint2, true);
+  }
+
+  @Test
+  public void testServerRequestFuturesRequestedAfterFailureWithoutHandler(Checkpoint checkpoint1, Checkpoint checkpoint2) throws Exception {
+    testServerRequestFuturesRequestedAfterFailure(checkpoint1, checkpoint2, false);
+  }
+
+  private void testServerRequestFuturesRequestedAfterFailure(Checkpoint checkpoint1, Checkpoint checkpoint2, boolean requestExceptionHandler) throws Exception {
+    server.requestHandler(req -> {
+      Handler<Throwable> onFailure = err -> vertx.setTimer(10, id -> {
+        Future<Buffer> body = req.body();
+        Future<Void> end = req.end();
+        Future.join(body, end).onComplete(ar -> {
+          assertTrue(body.failed());
+          assertTrue(end.failed());
+          checkpoint1.succeed();
+        });
+      });
+      if (requestExceptionHandler) {
+        req.exceptionHandler(onFailure);
+      } else {
+        req.response().exceptionHandler(onFailure);
+      }
+      checkpoint2.succeed();
+    });
+    startServer(testAddress);
+    HttpClientRequest request = client.request(requestOptions).await();
+    request.setChunked(true).write("chunk");
+    checkpoint2.awaitSuccess();
+    request.reset();
+  }
+
+  @Test
+  public void testResetClientRequestBeforeActualSend(Checkpoint checkpoint1, Checkpoint checkpoint2) throws Exception {
+    server.requestHandler(req -> {
+    });
+    startServer(testAddress);
+    client.request(requestOptions).onComplete(TestUtils.onSuccess(req -> {
+      req.response().onComplete(TestUtils.onFailure(err -> {
+        assertTrue(err instanceof StreamResetException);
+        checkpoint1.succeed();
+      }));
+      req.exceptionHandler(err -> {
+        assertTrue(err instanceof StreamResetException);
+        checkpoint2.succeed();
+      }).reset();
+    }));
+  }
+
+  @Test
+  public void testResetFromNonVertxThread(Checkpoint checkpoint) throws Exception {
+    server.requestHandler(req -> {
+    });
+    startServer(testAddress);
+    Context ctx = vertx.getOrCreateContext();
+    ctx.runOnContext(v -> {
+      client.request(requestOptions)
+        .onComplete(TestUtils.onSuccess(req -> {
+          req.exceptionHandler(err -> {
+            assertSame(Vertx.currentContext(), ctx);
+            checkpoint.succeed();
+          });
+          new Thread(req::reset).start();
+      }));
+    });
+  }
+
+  @Test
+  public void testResetClientRequestInProgress(Checkpoint checkpoint1, Checkpoint checkpoint2) throws Exception {
+    server.requestHandler(req -> {
+    });
+    startServer(testAddress);
+    Context ctx = vertx.getOrCreateContext();
+    ctx.runOnContext(v -> {
+      client.request(requestOptions).onComplete(TestUtils.onSuccess(req -> {
+        req.response().onComplete(TestUtils.onFailure(err -> checkpoint1.succeed()));
+        req.exceptionHandler(err -> checkpoint2.succeed());
+        req.writeHead().onComplete(TestUtils.onSuccess(version -> req.reset(0)));
+      }));
+    });
+  }
+
+  @Test
+  public void testResetClientRequestAwaitingResponse(Checkpoint checkpoint) throws Exception {
+    CompletableFuture<Void> fut = new CompletableFuture<>();
+    server.requestHandler(req -> {
+      fut.complete(null);
+    });
+    startServer(testAddress);
+    client.request(requestOptions).onComplete(TestUtils.onSuccess(req -> {
+      Context ctx = Vertx.currentContext();
+      req.response().onComplete(TestUtils.onFailure(err -> checkpoint.succeed()));
+      req.exceptionHandler(err -> Assert.fail());
+      req.end();
+      fut.thenAccept(v2 -> {
+        ctx.runOnContext(v3 -> {
+          req.reset(0);
+        });
+      });
+    }));
+  }
+
+  @Test
+  public void testResetClientRequestResponseInProgress(Checkpoint checkpoint) throws Exception {
+    server.requestHandler(req -> {
+      HttpServerResponse resp = req.response();
+      resp.setChunked(true);
+      for (int i = 0;i < 16;i++) {
+        resp.write("chunk-" + i);
+      }
+      resp.end();
+    });
+    startServer(testAddress);
+    client.request(requestOptions).onComplete(TestUtils.onSuccess(req -> {
+      req.send().onComplete(TestUtils.onSuccess(resp -> {
+        resp.handler(buff -> {
+          Assert.fail();
+        });
+        resp.endHandler(v -> {
+          Assert.fail();
+        });
+        req.connection().close().onComplete(TestUtils.onSuccess(v -> {
+          checkpoint.succeed();
+        }));
+        req.reset();
+      }));
+    }));
+  }
+
+  @Test
+  public void testResetClientRequestNotYetSentRecyclesLease() throws Exception {
+    testClientRequestNotYetSentRecyclesLease(req -> req.reset());
+  }
+
+  @Test
+  public void testCancelClientRequestNotYetSentRecyclesLease() throws Exception {
+    testClientRequestNotYetSentRecyclesLease(HttpClientRequest::cancel);
+  }
+
+  private void testClientRequestNotYetSentRecyclesLease(Function<HttpClientRequest, Future<?>> abort) throws Exception {
+    // Allow a single request at a time, the second request can only proceed when the lease is recycled
+    HttpServerConfig serverConfig = config.forServer().setMaxConcurrency(1).config();
+    server = vertx.httpServerBuilder()
+      .with(serverConfig)
+      .with(config.forServer().sslOptions())
+      .build();
+    server.requestHandler(req -> req.response().end());
+    startServer(testAddress);
+    PoolOptions poolOptions = new PoolOptions()
+      .setHttp1MaxSize(1)
+      .setHttp2MaxSize(1)
+      .setHttp3MaxSize(1);
+    client = config
+      .forClient()
+      .create(vertx, poolOptions);
+    HttpClientRequest request = client.request(requestOptions).await();
+    HttpConnection connection = request.connection();
+    abort.apply(request).await();
+    HttpClientRequest next = client.request(requestOptions).await(10, TimeUnit.SECONDS);
+    assertSame(connection, next.connection());
+    next
+      .send()
+      .compose(HttpClientResponse::end)
+      .await(10, TimeUnit.SECONDS);
+  }
+
+  @Test
+  public void testResetPartialClientRequest(Checkpoint checkpoint) throws Exception {
+    server.requestHandler(req -> {
+    });
+    startServer(testAddress);
+    client.request(requestOptions).onComplete(TestUtils.onSuccess(req -> {
+      assertTrue(req.reset().succeeded());
+      req.end("body").onComplete(TestUtils.onFailure(err -> {
+        checkpoint.succeed();
+      }));
+    }));
+  }
+
+  @Test
+  public void testCancelPartialServerResponse(Checkpoint checkpoint1, Checkpoint checkpoint2) throws Exception {
+    server.requestHandler(req -> {
+      HttpServerResponse resp = req.response();
+      resp.exceptionHandler(err -> {
+        switch (req.version()) {
+          case HTTP_1_1:
+            assertSame(HttpClosedException.class, err.getClass());
+            checkpoint1.succeed();
+            break;
+          case HTTP_2:
+            if (err instanceof HttpClosedException) {
+              checkpoint1.succeed();
+            } else if (err instanceof StreamResetException) {
+              assertEquals(8L, ((StreamResetException)err).getCode());
+            } else {
+              Assert.fail();
+            }
+            break;
+          default:
+            Assert.fail();
+            break;
+        }
+      });
+      resp.setChunked(true);
+      resp.write("chunk");
+    });
+    startServer(testAddress);
+    client.request(requestOptions).onComplete(TestUtils.onSuccess(req -> {
+      req.send().onComplete(TestUtils.onSuccess(resp -> {
+        resp.handler(chunk -> {
+          req.cancel().onComplete(TestUtils.onSuccess(b -> {
+            assertTrue(b);
+            checkpoint2.succeed();
+          }));
+        });
+      }));
+    }));
+  }
+
+  @Test
+  public void testCancelPartialClientRequest(Checkpoint checkpoint) throws Exception {
+    List<HttpServerRequest> serverRequests = Collections.synchronizedList(new ArrayList<>());
+    server.requestHandler(serverRequests::add);
+    startServer(testAddress);
+    HttpClientRequest clientRequest = client.request(requestOptions).await();
+    clientRequest.exceptionHandler(err -> {
+      switch (clientRequest.version()) {
+        case HTTP_1_1:
+          assertSame(HttpClosedException.class, err.getClass());
+          break;
+        case HTTP_2:
+          assertSame(StreamResetException.class, err.getClass());
+          assertEquals(8L, ((StreamResetException)err).getCode());
+          break;
+        default:
+          Assert.fail();
+          return;
+      }
+      checkpoint.succeed();
+    });
+    clientRequest.setChunked(true).writeHead().await();
+    assertWaitUntil(() -> serverRequests.size() == 1);
+    HttpServerRequest serverRequest = serverRequests.get(0);
+    assertTrue(serverRequest.response().cancel().await());
+  }
+
+  @Test
+  public void testSimpleCookie() throws Exception {
+    testCookies("foo=bar", req -> {
+      assertEquals(1, req.cookieCount());
+      Cookie cookie = req.getCookie("foo");
+      assertNotNull(cookie);
+      assertEquals("bar", cookie.getValue());
+      req.response().end();
+    }, response -> {
+    });
+  }
+
+  @Test
+  public void testGetCookies() throws Exception {
+    testCookies("foo=bar; wibble=blibble; plop=flop", req -> {
+      assertEquals(3, req.cookieCount());
+      Set<Cookie> cookies = req.cookies();
+      assertNotNull(req.getCookie("foo"));
+      assertNotNull(req.getCookie("wibble"));
+      assertNotNull(req.getCookie("plop"));
+      Cookie removed = req.response().removeCookie("foo");
+      // removed cookies, need to be sent back with an expiration date
+      assertNotNull(req.getCookie("foo"));
+      assertNotNull(req.getCookie("wibble"));
+      assertNotNull(req.getCookie("plop"));
+      req.response().end();
+    }, resp -> {
+      List<String> cookies = resp.headers().getAll("set-cookie");
+      // the expired cookie must be sent back
+      assertEquals(1, cookies.size());
+      assertTrue(cookies.get(0).contains("Max-Age=0"));
+      assertTrue(cookies.get(0).contains("Expires="));
+    });
+  }
+
+  @Test
+  public void testGetCookiesSameIdentity() throws Exception {
+    testCookies(null, req -> {
+      assertEquals(req.response(), req.response().addCookie(Cookie.cookie("foo", "bar").setPath("/")));
+      assertEquals(req.response(), req.response().addCookie(Cookie.cookie("foo", "bar").setPath("/sub")));
+      assertEquals(req.response(), req.response().addCookie(Cookie.cookie("foo", "bar").setPath("/sub").setDomain("www.vertx.io")));
+      req.response().end();
+    }, resp -> {
+      List<String> cookies = resp.headers().getAll("set-cookie");
+      assertEquals(3, cookies.size());
+      assertTrue(cookies.contains("foo=bar; Path=/"));
+      assertTrue(cookies.contains("foo=bar; Path=/sub"));
+      assertTrue(cookies.contains("foo=bar; Path=/sub; Domain=www.vertx.io"));
+    });
+  }
+
+  @Test
+  public void testGetCookiesSameIdentityRemoveOne() throws Exception {
+    testCookies(null, req -> {
+      assertEquals(req.response(), req.response().addCookie(Cookie.cookie("foo", "bar").setPath("/")));
+      assertEquals(req.response(), req.response().addCookie(Cookie.cookie("foo", "bar").setPath("/sub")));
+      assertEquals(req.response(), req.response().addCookie(Cookie.cookie("foo", "bar").setPath("/sub").setDomain("www.vertx.io")));
+      // will remove the first one only
+      req.response().removeCookie("foo");
+      req.response().end();
+    }, resp -> {
+      List<String> cookies = resp.headers().getAll("set-cookie");
+      assertEquals(2, cookies.size());
+      assertTrue(cookies.contains("foo=bar; Path=/sub"));
+      assertTrue(cookies.contains("foo=bar; Path=/sub; Domain=www.vertx.io"));
+    });
+  }
+
+  @Test
+  public void testGetCookiesSameIdentityRemoveAll() throws Exception {
+    testCookies(null, req -> {
+      assertEquals(req.response(), req.response().addCookie(Cookie.cookie("foo", "bar").setPath("/")));
+      assertEquals(req.response(), req.response().addCookie(Cookie.cookie("foo", "bar").setPath("/sub")));
+      assertEquals(req.response(), req.response().addCookie(Cookie.cookie("foo", "bar").setPath("/sub").setDomain("www.vertx.io")));
+      req.response().removeCookies("foo");
+      req.response().end();
+    }, resp -> {
+      List<String> cookies = resp.headers().getAll("set-cookie");
+      assertEquals(0, cookies.size());
+    });
+  }
+
+  @Test
+  public void testGetCookiesSameIdentityReplace() throws Exception {
+    testCookies(null, req -> {
+      assertEquals(req.response(), req.response().addCookie(Cookie.cookie("foo", "bar").setPath("/")));
+      assertEquals(req.response(), req.response().addCookie(Cookie.cookie("foo", "bar").setPath("/sub")));
+      assertEquals(req.response(), req.response().addCookie(Cookie.cookie("foo", "bar").setPath("/sub").setDomain("www.vertx.io")));
+      // will replace the last only
+      assertEquals(req.response(), req.response().addCookie(Cookie.cookie("foo", "barista").setPath("/sub").setDomain("www.vertx.io")));
+      req.response().end();
+    }, resp -> {
+      List<String> cookies = resp.headers().getAll("set-cookie");
+      assertEquals(3, cookies.size());
+      assertTrue(cookies.contains("foo=bar; Path=/"));
+      assertTrue(cookies.contains("foo=bar; Path=/sub"));
+      assertTrue(cookies.contains("foo=barista; Path=/sub; Domain=www.vertx.io"));
+    });
+  }
+
+  @Test
+  public void testCookiesChanged() throws Exception {
+    testCookies("foo=bar; wibble=blibble; plop=flop", req -> {
+      assertEquals(3, req.cookieCount());
+      assertEquals("bar", req.getCookie("foo").getValue());
+      assertEquals("blibble", req.getCookie("wibble").getValue());
+      assertEquals("flop", req.getCookie("plop").getValue());
+      req.response().removeCookie("plop");
+      // the expected number of elements should remain the same as we're sending an invalidate cookie back
+      assertEquals(3, req.cookieCount());
+
+      assertEquals("bar", req.getCookie("foo").getValue());
+      assertEquals("blibble", req.getCookie("wibble").getValue());
+      assertNotNull(req.getCookie("plop"));
+      req.response().addCookie(Cookie.cookie("fleeb", "floob"));
+      assertEquals(4, req.cookieCount());
+      assertNull(req.response().removeCookie("blarb"));
+      assertEquals(4, req.cookieCount());
+      Cookie foo = req.getCookie("foo");
+      foo.setValue("blah");
+      req.response().end();
+    }, resp -> {
+      List<String> cookies = resp.headers().getAll("set-cookie");
+      assertEquals(3, cookies.size());
+      assertTrue(cookies.contains("foo=blah"));
+      assertTrue(cookies.contains("fleeb=floob"));
+      boolean found = false;
+      for (String s : cookies) {
+        if (s.startsWith("plop")) {
+          found = true;
+          assertTrue(s.contains("Max-Age=0"));
+          assertTrue(s.contains("Expires="));
+          break;
+        }
+      }
+      assertTrue(found);
+    });
+  }
+
+  @Test
+  public void testCookieFields() throws Exception {
+    Cookie cookie = Cookie.cookie("foo", "bar");
+    assertEquals("foo", cookie.getName());
+    assertEquals("bar", cookie.getValue());
+    assertEquals("foo=bar", cookie.encode());
+    assertNull(cookie.getPath());
+    cookie.setPath("/somepath");
+    assertEquals("/somepath", cookie.getPath());
+    assertEquals("foo=bar; Path=/somepath", cookie.encode());
+    assertNull(cookie.getDomain());
+    cookie.setDomain("foo.com");
+    assertEquals("foo.com", cookie.getDomain());
+    assertEquals("foo=bar; Path=/somepath; Domain=foo.com", cookie.encode());
+    long maxAge = 30 * 60;
+    cookie.setMaxAge(maxAge);
+    assertEquals(maxAge, cookie.getMaxAge());
+
+    long now = System.currentTimeMillis();
+    String encoded = cookie.encode();
+    int startPos = encoded.indexOf("Expires=");
+    int endPos = encoded.indexOf(';', startPos);
+    String expiresDate = encoded.substring(startPos + 8, endPos);
+    // RFC1123
+    DateFormat dtf = new SimpleDateFormat("EEE, dd MMM yyyy HH:mm:ss zzz", Locale.ENGLISH);
+    dtf.setTimeZone(TimeZone.getTimeZone("GMT"));
+    Date d = dtf.parse(expiresDate);
+    assertTrue(d.getTime() - now >= maxAge);
+
+    cookie.setMaxAge(Long.MIN_VALUE);
+    cookie.setSecure(true);
+    assertTrue(cookie.isSecure());
+    assertEquals("foo=bar; Path=/somepath; Domain=foo.com; Secure", cookie.encode());
+    cookie.setHttpOnly(true);
+    assertTrue(cookie.isHttpOnly());
+    assertEquals("foo=bar; Path=/somepath; Domain=foo.com; Secure; HTTPOnly", cookie.encode());
+  }
+
+  @Test
+  public void testCookieSameSiteFieldEncoding() {
+    Cookie cookie = Cookie.cookie("foo", "bar").setSameSite(CookieSameSite.LAX);
+    assertEquals("foo", cookie.getName());
+    assertEquals("bar", cookie.getValue());
+    assertEquals(CookieSameSite.LAX, cookie.getSameSite());
+    assertEquals("foo=bar; SameSite=Lax", cookie.encode());
+
+    cookie.setSecure(true);
+    assertEquals("foo=bar; Secure; SameSite=Lax", cookie.encode());
+    cookie.setHttpOnly(true);
+    assertEquals("foo=bar; Secure; HTTPOnly; SameSite=Lax", cookie.encode());
+  }
+
+  @Test
+  public void testCookieSameSiteFieldValidation() throws Exception {
+    Cookie cookie = Cookie.cookie("foo", "bar");
+
+    try {
+      cookie.setSameSite(CookieSameSite.LAX);
+      // OK
+      cookie.setSameSite(CookieSameSite.STRICT);
+      // OK
+      cookie.setSameSite(CookieSameSite.NONE);
+      // OK
+      cookie.setSameSite(null);
+      // OK
+    } catch (RuntimeException e) {
+      Assert.fail();
+    }
+  }
+
+  @Test
+  public void testRemoveCookies() throws Exception {
+    testCookies("foo=bar", req -> {
+      Cookie removed = req.response().removeCookie("foo");
+      assertNotNull(removed);
+      assertEquals("foo", removed.getName());
+      assertEquals("", removed.getValue());
+      req.response().end();
+    }, resp -> {
+      List<String> cookies = resp.headers().getAll("set-cookie");
+      // the expired cookie must be sent back
+      assertEquals(1, cookies.size());
+      assertTrue(cookies.get(0).contains("foo="));
+      assertTrue(cookies.get(0).contains("Max-Age=0"));
+      assertTrue(cookies.get(0).contains("Expires="));
+    });
+  }
+
+  @Test
+  public void testNoCookiesRemoveCookie() throws Exception {
+    testCookies(null, req -> {
+      req.response().removeCookie("foo");
+      req.response().end();
+    }, resp -> {
+      List<String> cookies = resp.headers().getAll("set-cookie");
+      assertEquals(0, cookies.size());
+    });
+  }
+
+  @Test
+  public void testNoCookiesCookieCount() throws Exception {
+    testCookies(null, req -> {
+      assertEquals(0, req.cookieCount());
+      req.response().end();
+    }, resp -> {
+      List<String> cookies = resp.headers().getAll("set-cookie");
+      assertEquals(0, cookies.size());
+    });
+  }
+
+  @Test
+  public void testNoCookiesGetCookie() throws Exception {
+    testCookies(null, req -> {
+      assertNull(req.getCookie("foo"));
+      req.response().end();
+    }, resp -> {
+      List<String> cookies = resp.headers().getAll("set-cookie");
+      assertEquals(0, cookies.size());
+    });
+  }
+
+  @Test
+  public void testNoCookiesAddCookie() throws Exception {
+    testCookies(null, req -> {
+      assertEquals(req.response(), req.response().addCookie(Cookie.cookie("foo", "bar")));
+      req.response().end();
+    }, resp -> {
+      List<String> cookies = resp.headers().getAll("set-cookie");
+      assertEquals(1, cookies.size());
+    });
+  }
+
+  @Test
+  public void testReplaceCookie() throws Exception {
+    testCookies("XSRF-TOKEN=c359b44aef83415", req -> {
+      assertEquals(1, req.cookieCount());
+      req.response().addCookie(Cookie.cookie("XSRF-TOKEN", "88533580000c314").setPath("/"));
+      assertFalse(((ServerCookie) req.getCookie("XSRF-TOKEN")).isFromUserAgent());
+      assertEquals("/", req.getCookie("XSRF-TOKEN").getPath());
+      req.response().end();
+    }, resp -> {
+      List<String> cookies = resp.headers().getAll("set-cookie");
+      // the expired cookie must be sent back
+      assertEquals(1, cookies.size());
+      // ensure that the cookie jar was updated correctly
+      assertEquals("XSRF-TOKEN=88533580000c314; Path=/", cookies.get(0));
+    });
+  }
+
+  private void testCookies(String cookieHeader, Consumer<HttpServerRequest> serverChecker, Consumer<HttpClientResponse> clientChecker) throws Exception {
+    server.requestHandler(serverChecker::accept);
+    startServer(testAddress);
+    client.request(requestOptions)
+      .compose(req -> req
+        .putHeader(HttpHeaders.COOKIE.toString(), cookieHeader)
+        .send());
+    client.request(requestOptions)
+      .compose(req -> req
+        .putHeader(HttpHeaders.COOKIE.toString(), cookieHeader)
+        .send()
+        .compose(resp -> {
+          clientChecker.accept(resp);
+          return resp.end();
+        }))
+      .await();
+  }
+
+  @Test
+  public void testClientRequestFutureSetHandlerFromAnotherThread(Checkpoint checkpoint1, Checkpoint checkpoint2) throws Exception {
+    server.requestHandler(req -> {
+      req.response().end();
+    });
+    startServer(testAddress);
+    Context ctx = vertx.getOrCreateContext();
+    CompletableFuture<HttpClientRequest> reqFut = new CompletableFuture<>();
+    ctx.runOnContext(v -> {
+      client = createHttpClient();
+      client.request(requestOptions).onComplete(TestUtils.onSuccess(req -> {
+        Future<HttpClientResponse> response = req.response();
+        response.onComplete(checkpoint1);
+        reqFut.complete(req);
+      }));
+    });
+    HttpClientRequest req = reqFut.get(10, TimeUnit.SECONDS);
+    Future<Void> endFut = req.end("msg");
+    waitUntil(endFut::succeeded);
+    // Set the handler after the future
+    endFut.onComplete(TestUtils.onSuccess(v -> {
+      assertNotNull(Vertx.currentContext());
+      TestUtils.assertSameEventLoop(ctx, Vertx.currentContext());
+      checkpoint2.succeed();
+    }));
+  }
+
+  @Test
+  public void testClientRequestWithLargeBodyInSmallChunks(Checkpoint checkpoint) throws Exception {
+    testClientRequestWithLargeBodyInSmallChunks(checkpoint, false, HttpClientRequest::send);
+  }
+
+  @Test
+  public void testClientRequestWithLargeBodyInSmallChunksChunked(Checkpoint checkpoint) throws Exception {
+    testClientRequestWithLargeBodyInSmallChunks(checkpoint, true, HttpClientRequest::send);
+  }
+
+  @Test
+  public void testClientRequestWithLargeBodyInSmallChunksWithHandler(Checkpoint checkpoint) throws Exception {
+    testClientRequestWithLargeBodyInSmallChunks(checkpoint, false, HttpClientRequest::send);
+  }
+
+  @Test
+  public void testClientRequestWithLargeBodyInSmallChunksChunkedWithHandler(Checkpoint checkpoint) throws Exception {
+    testClientRequestWithLargeBodyInSmallChunks(checkpoint, true, HttpClientRequest::send);
+  }
+
+  private void testClientRequestWithLargeBodyInSmallChunks(Checkpoint checkpoint, boolean chunked, BiFunction<HttpClientRequest, ReadStream<Buffer>, Future<HttpClientResponse>> sendFunction) throws Exception {
+    StringBuilder sb = new StringBuilder();
+    FakeStream<Buffer> src = new FakeStream<>();
+    src.pause();
+    int numChunks = 1024;
+    int chunkLength = 1024;
+    for (int i = 0;i < numChunks;i++) {
+      String chunk = randomAlphaString(chunkLength);
+      sb.append(chunk);
+      src.write(Buffer.buffer(chunk));
+    }
+    src.end();
+    String expected = sb.toString();
+    String contentLength = "" + numChunks * chunkLength;
+    server.requestHandler(req -> {
+      assertEquals(chunked ? null : contentLength, req.getHeader(HttpHeaders.CONTENT_LENGTH));
+      assertEquals(chunked & req.version() == HttpVersion.HTTP_1_1 ? HttpHeaders.CHUNKED.toString() : null, req.getHeader(HttpHeaders.TRANSFER_ENCODING));
+      req.bodyHandler(body -> {
+        assertEquals(HttpMethod.PUT, req.method());
+        assertEquals(Buffer.buffer(expected), body);
+        checkpoint.succeed();
+        req.response().end();
+      });
+    });
+    startServer(testAddress);
+    RequestOptions options = new RequestOptions()
+      .setMethod(HttpMethod.PUT)
+      .setPort(config.port())
+      .setHost(config.host())
+      .setURI(DEFAULT_TEST_URI);
+    client.request(options)
+      .compose(req -> {
+        if (!chunked) {
+          req.putHeader(HttpHeaders.CONTENT_LENGTH, contentLength);
+        }
+        return sendFunction
+          .apply(req,src)
+          .expecting(HttpResponseExpectation.SC_OK);
+      }).await();
+  }
+
+  @Test
+  public void testClientRequestFlowControlDifferentEventLoops(Checkpoint checkpoint) throws Exception {
+    Promise<Void> resume = Promise.promise();
+    server.requestHandler(req -> {
+      req.pause();
+      req.end().onComplete(v -> {
+        req.response().end();
+      });
+      resume.future().onComplete(ar -> req.resume());
+    });
+    startServer(testAddress);
+    client = createHttpClient(new PoolOptions().setHttp1MaxSize(1));
+    Buffer chunk = Buffer.buffer(TestUtils.randomAlphaString(1024));
+    client.request(requestOptions).onComplete(TestUtils.onSuccess(req1 -> {
+      assertTrue(req1.reset().succeeded());
+      new Thread(() -> {
+        Context ctx = vertx.getOrCreateContext();
+        ctx.runOnContext(v1 -> {
+          client.request(requestOptions).onComplete(TestUtils.onSuccess(req2 -> {
+            assertSame(ctx, vertx.getOrCreateContext());
+            req2.setChunked(true);
+            while (!req2.writeQueueFull()) {
+              req2.write(chunk);
+            }
+            resume.complete();
+            req2.drainHandler(v -> {
+              assertSame(ctx, vertx.getOrCreateContext());
+              req2.end();
+            });
+            req2.response().onComplete(TestUtils.onSuccess(resp -> {
+              assertSame(ctx, vertx.getOrCreateContext());
+              resp.end().onComplete(TestUtils.onSuccess(v2 -> {
+                assertSame(ctx, vertx.getOrCreateContext());
+                checkpoint.succeed();
+              }));
+            }));
+          }));
+        });
+      }).start();
+    }));
+  }
+
+  @Test
+  public void testClientClose() throws Exception {
+    AtomicInteger inflight = new AtomicInteger();
+    int num = 3;
+    List<HttpServer> servers = new ArrayList<>();
+    try {
+      for (int i = 0;i < num;i++) {
+        HttpServer server = createHttpServer();
+        server.requestHandler(req -> {
+        });
+        startServer(inetSocketAddress(config.port() + i, config.host()), server);
+        servers.add(server);
+      }
+      client = httpClientBuilder()
+        .withConnectHandler(conn -> {
+          inflight.incrementAndGet();
+          conn.closeHandler(v -> {
+            inflight.decrementAndGet();
+          });
+        })
+        .build();
+      for (int i = 0;i < num;i++) {
+        client.request(new RequestOptions()
+          .setHost(config.host())
+          .setPort(config.port() + i))
+          .onComplete(TestUtils.onSuccess(HttpClientRequest::send));
+      }
+      assertWaitUntil(() -> inflight.get() == num);
+      client
+        .close()
+        .await();
+      assertWaitUntil(() -> inflight.get() == 0);
+    } finally {
+      servers.forEach(HttpServer::close);
+    }
+  }
+
+  @Test
+  public void testStickyEventLoops() throws Exception {
+    Set<EventLoop> contexts = new HashSet<>();
+    server.requestHandler(req -> {
+      req.response().end();
+    });
+    startServer(testAddress);
+    int numReq = 3;
+    CountDownLatch latch = new CountDownLatch(numReq);
+    for (int i = 0;i < numReq;i++) {
+      client.request(requestOptions).onComplete(TestUtils.onSuccess(req -> {
+        req.send().onComplete(TestUtils.onSuccess(resp -> {
+          contexts.add(((ContextInternal)Vertx.currentContext()).nettyEventLoop());
+          latch.countDown();
+        }));
+      }));
+    }
+    TestUtils.awaitLatch(latch);
+    assertEquals(1, contexts.size());
+  }
+
+  @Test
+  public void testHttpServerEndHandlerSuccess() throws Exception {
+    server.requestHandler(req -> {
+      req.end().onComplete(TestUtils.onSuccess(v -> {
+        req.response().end();
+      }));
+    });
+    startServer(testAddress);
+
+    client.request(requestOptions)
+      .compose(req -> req
+        .send()
+        .expecting(HttpResponseExpectation.SC_OK))
+      .await();
+  }
+
+  @Test
+  public void testHttpServerEndHandlerError(Checkpoint checkpoint) throws Exception {
+    Promise<Void> promise = Promise.promise();
+    server.requestHandler(req -> {
+      promise.complete();
+      req.end().onComplete(TestUtils.onFailure(err -> {
+        checkpoint.succeed();
+      }));
+    });
+    startServer(testAddress);
+    RequestOptions opts = new RequestOptions(requestOptions).setMethod(PUT);
+    client.request(opts).compose(req -> req
+        .writeHead()
+        .compose(v -> promise.future())
+        .compose(v -> req
+          .connection()
+          .close()))
+      .await();
+  }
+
+  @Test
+  public void testHttpClientEndHandlerSuccess() throws Exception {
+    server.requestHandler(req -> {
+      req.response().end("hello");
+    });
+    startServer(testAddress);
+    client.request(requestOptions).compose(req -> req
+        .send()
+        .expecting(HttpResponseExpectation.SC_OK)
+        .compose(HttpClientResponse::end))
+      .await();
+  }
+
+  @Test
+  public void testHttpClientEndHandlerFailure() throws Exception {
+    Promise<Void> promise = Promise.promise();
+    server.requestHandler(req -> {
+      req
+        .response()
+        .setChunked(true)
+        .write("hello");
+      promise.future().onSuccess(v -> {
+        req.connection().close();
+      });
+    });
+    startServer(testAddress);
+    assertThatThrownBy(() ->
+      client
+        .request(requestOptions)
+        .compose(req -> req
+          .send()
+          .compose(resp -> {
+            promise.complete();
+            return resp.end();
+          }))
+        .await()
+    );
+  }
+
+  @Test
+  public void testServerResponseSend() throws Exception {
+    testServerResponseSend(false);
+  }
+
+  protected void testServerResponseSend(boolean chunked) throws Exception {
+    int num = 16;
+    List<Buffer> chunks = new ArrayList<>();
+    Buffer expected = Buffer.buffer();
+    for (int i = 0;i < num;i++) {
+      Buffer chunk = Buffer.buffer("chunk-" + i);
+      chunks.add(chunk);
+      expected.appendBuffer(chunk);
+    }
+    String contentLength = "" + expected.length();
+    server.requestHandler(req -> {
+      FakeStream<Buffer> stream = new FakeStream<>();
+      stream.pause();
+      stream.emit(chunks.stream());
+      stream.end();
+      HttpServerResponse resp = req.response();
+      if (!chunked) {
+        resp.putHeader(HttpHeaders.CONTENT_LENGTH, contentLength);
+      }
+      resp.send(stream);
+    });
+    startServer(testAddress);
+    List<Buffer> list = client.request(requestOptions).compose(req -> req.send().compose(resp -> {
+      if (!chunked) {
+        assertEquals(contentLength, resp.getHeader(HttpHeaders.CONTENT_LENGTH));
+      }
+      List<Buffer> l = new ArrayList<>();
+      resp.handler(buff -> {
+        if (buff.length() > 0) {
+          l.add(buff); // Last HTTP2/2 buffer is empty
+        }
+      });
+      return resp.end().map(l);
+    })).await();
+    if (chunked) {
+      assertEquals(num, list.size());
+    }
+    Buffer result = Buffer.buffer();
+    list.forEach(result::appendBuffer);
+    assertEquals(expected, result);
+  }
+
+  @Test
+  public void testConnectTimeout() {
+    client = config.forClient().setConnectTimeout(Duration.ofMillis(1)).create(vertx);
+    assertThatThrownBy(() -> {
+      client
+        .request(new RequestOptions().setHost(TestUtils.NON_ROUTABLE_HOST).setPort(config.port()))
+        .await();
+    }).isInstanceOf(ConnectTimeoutException.class);
+  }
+
+  @Test
+  public void testResponseEndFutureCompletes_WithoutBody(Checkpoint checkpoint) throws Exception {
+      testResponseEndFutureCompletes(checkpoint, HttpServerResponse::end);
+  }
+
+  @Test
+  public void testResponseEndFutureCompletes_WithBody(Checkpoint checkpoint) throws Exception {
+    testResponseEndFutureCompletes(checkpoint, httpServerResponse -> httpServerResponse.end("hello"));
+  }
+
+  @Test
+  public void testResponseEndFutureCompletes_ChunkedWithoutBody(Checkpoint checkpoint) throws Exception {
+    testResponseEndFutureCompletes(checkpoint, httpServerResponse -> httpServerResponse.setChunked(true).write("hello")
+      .compose(nothing -> httpServerResponse.end())
+    );
+  }
+
+  @Test
+  public void testResponseEndFutureCompletes_ChunkedWithBody(Checkpoint checkpoint) throws Exception {
+    testResponseEndFutureCompletes(checkpoint, httpServerResponse -> httpServerResponse.setChunked(true).write("hello")
+      .compose(nothing -> httpServerResponse.end("world"))
+    );
+  }
+
+  private void testResponseEndFutureCompletes(Checkpoint checkpoint, Function<HttpServerResponse, Future<Void>> function) throws Exception {
+    server.requestHandler(
+      httpServerRequest -> function.apply(httpServerRequest.response())
+        .onComplete(checkpoint)
+    );
+    startServer(testAddress);
+    client.request(requestOptions)
+      .compose(req -> req
+        .send()
+        .expecting(HttpResponseExpectation.SC_OK)
+        .compose(HttpClientResponse::end))
+      .await();
+  }
+
+  @Test
+  public void shouldThrowISEIfSendingResponseFromHeadersEndHandler(Checkpoint checkpoint) throws Exception {
+    AtomicBoolean flag = new AtomicBoolean();
+    server.requestHandler(req -> {
+        HttpServerResponse resp = req.response();
+        resp.headersEndHandler(v -> {
+          if (flag.compareAndSet(false, true)) {
+            try {
+              resp.end("bar");
+            } catch (IllegalStateException e) {
+              checkpoint.succeed();
+            }
+          }
+        });
+        resp.end("foo");
+        checkpoint.succeed();
+      }
+    );
+    startServer(testAddress);
+    client.request(requestOptions)
+      .compose(req -> req.send()
+        .expecting(HttpResponseExpectation.SC_OK)
+        .compose(HttpClientResponse::end))
+      .await();
+  }
+
+  @Test
+  public void testInvalidPort() {
+    try {
+      server.requestHandler(req -> {
+
+      }).listen(65536);
+      Assert.fail();
+    } catch (IllegalArgumentException ignore) {
+    }
+  }
+
+  @Test
+  public void testConcurrentWrites1() throws Exception {
+    testConcurrentWrites(req -> req
+      .writeHead()
+      .compose(v -> {
+        AtomicBoolean latch = new AtomicBoolean(false);
+        new Thread(() -> {
+          req.write("msg1");
+          latch.set(true); // Release Event-loop thread
+        }).start();
+        // Active wait for the event to be published
+        while (!latch.get()) {
+        }
+        req.write("msg2");
+        req.end();
+        return req.response();
+      }));
+  }
+
+  @Test
+  public void testConcurrentWrites2() throws Exception {
+    testConcurrentWrites(req -> {
+      AtomicBoolean latch = new AtomicBoolean(false);
+      new Thread(() -> {
+        req.writeHead();
+        latch.set(true); // Release Event-loop thread
+      }).start();
+      // Active wait for the event to be published
+      while (!latch.get()) {
+      }
+      req.write("msg1");
+      req.write("msg2");
+      req.end();
+      return req.response();
+    });
+  }
+
+  private void testConcurrentWrites(Function<HttpClientRequest, Future<HttpClientResponse>> action) throws Exception {
+    AtomicReference<String> received = new AtomicReference<>();
+    server.requestHandler(req -> req.body()
+                                    .onSuccess(buffer -> {
+                                      received.set(buffer.toString());
+                                      req.response().end();
+                                    }));
+    startServer(testAddress);
+    client = createHttpClient();
+    client.request(requestOptions)
+      .compose(req -> {
+        req.setChunked(true);
+        return action.apply(req);
+      }).await();
+    assertEquals("msg1msg2", received.get());
+  }
+
+  @Test
+  public void testHttpServerResponseWriteHead(Checkpoint checkpoint) throws Exception {
+    AtomicReference<Runnable> continuation = new AtomicReference<>();
+    server.requestHandler(req -> {
+      HttpServerResponse resp = req.response();
+      continuation.set(() -> resp.end("body"));
+      resp
+        .writeHead()
+        .onComplete(checkpoint);
+    });
+    startServer(testAddress);
+    client.request(requestOptions).onComplete(TestUtils.onSuccess(req -> {
+      req.send().onComplete(TestUtils.onSuccess(response -> {
+        response.handler(chunk -> {
+          Assert.fail();
+        });
+        response.endHandler(v -> {
+          Assert.fail();
+        });
+        vertx.setTimer(200, id -> {
+          response.handler(null);
+          response.endHandler(null);
+          response.bodyHandler(body -> {
+            assertEquals("body", body.toString());
+            checkpoint.succeed();
+          });
+          continuation.get().run();
+        });
+      }));
+    }));
+  }
+
+  @Test
+  public void testClientShutdown() throws Exception {
+    long timeout = 10000;
+    AtomicReference<HttpServerResponse> ref = new AtomicReference<>();
+    server.requestHandler(request -> {
+      HttpServerResponse response = request.response();
+      ref.set(response);
+      response.setChunked(true).writeHead();
+    });
+    startServer(testAddress);
+    CountDownLatch shutdownLatch = new CountDownLatch(1);
+    HttpClientRequest request = client.request(requestOptions).await();
+    request.connection().shutdownHandler(v -> {
+      shutdownLatch.countDown();
+    });
+    request.end().await();
+    waitUntil(() -> ref.get() != null);
+    long now = System.currentTimeMillis();
+    HttpClientResponse response = request.response().await();
+    Future<Buffer> body = response.body();
+    client.shutdown(timeout, TimeUnit.MILLISECONDS);
+    TestUtils.awaitLatch(shutdownLatch);
+    assertTrue((System.currentTimeMillis() - now) < timeout / 4);
+    ref.get().end("Hello World").await();
+    assertEquals("Hello World", body.await().toString());
+    assertTrue((System.currentTimeMillis() - now) < timeout / 4);
+  }
+
+  @Test
+  public void testServerShutdown() throws Exception {
+    long timeout = 10000;
+    AtomicReference<HttpServerRequest> ref = new AtomicReference<>();
+    CountDownLatch shutdownLatch = new CountDownLatch(1);
+    server.requestHandler(request -> {
+      request.connection().shutdownHandler(v -> {
+        shutdownLatch.countDown();
+      });
+      ref.set(request);
+    });
+    startServer(testAddress);
+    HttpClientRequest request = client.request(requestOptions).await();
+    Future<HttpClientResponse> fut = request.send();
+    long now = System.currentTimeMillis();
+    waitUntil(() -> ref.get() != null);
+    server.shutdown(timeout, TimeUnit.MILLISECONDS);
+    TestUtils.awaitLatch(shutdownLatch);
+    assertTrue((System.currentTimeMillis() - now) < timeout / 4);
+    ref.get().response().end();
+    fut.await();
+    assertTrue((System.currentTimeMillis() - now) < timeout / 4);
+  }
+
+  @Test
+  public void testConnectionVersion() throws Exception {
+    server.requestHandler(request -> {
+      assertEquals(request.version(), request.connection().protocolVersion());
+      request.response().end();
+    });
+    startServer(testAddress);
+    client.request(requestOptions)
+      .compose(req -> req
+        .send()
+        .expecting(HttpResponseExpectation.SC_OK)
+        .compose(HttpClientResponse::end))
+      .await();
+  }
+
+  @Test
+  public void testNoAuthority() throws Exception {
+    Assume.assumeTrue(testAddress.isInetSocket());
+    assertEquals(testAddress.toString(), testNoAuthority(false).toString());
+  }
+
+  @Test
+  public void testForceNoAuthority() throws Exception {
+    Assume.assumeTrue(testAddress.isInetSocket() && config.version() != HttpVersion.HTTP_3);
+    assertEquals("null", testNoAuthority(true).toString());
+  }
+
+  public Buffer testNoAuthority(boolean force) throws Exception {
+    server.requestHandler(request -> {
+      request
+        .response()
+        .end("" + request.authority());
+    });
+
+    startServer(testAddress);
+
+    return client
+      .request(new RequestOptions().setServer(testAddress))
+      .compose(request -> {
+        assertEquals(testAddress.toString(), request.authority().toString());
+        if (force) {
+          request.authority(null);
+        }
+        return request
+          .send()
+          .expecting(HttpResponseExpectation.SC_OK)
+          .compose(HttpClientResponse::body);
+      })
+      .await();
+  }
+
+  @Test
+  public void testPausedCompleteResponseAfterConnectionClose() throws Exception {
+    Buffer expected = Buffer.buffer("response body");
+    Promise<HttpConnection> serverConn = Promise.promise();
+    server.requestHandler(req -> {
+      serverConn.complete(req.connection());
+      req.response().end(expected);
+    });
+    startServer(testAddress);
+
+    Promise<HttpClientResponse> paused = Promise.promise();
+    Promise<Throwable> requestFailure = Promise.promise();
+    AtomicBoolean responseEnded = new AtomicBoolean();
+    client.request(new RequestOptions(requestOptions).setMethod(HttpMethod.POST))
+      .onComplete(TestUtils.onSuccess(request -> {
+        request.setChunked(true);
+        request.exceptionHandler(requestFailure::complete);
+        request.response().onComplete(TestUtils.onSuccess(response -> {
+          response.pause();
+          response.endHandler(v -> responseEnded.set(true));
+          response.body();
+          paused.complete(response);
+        }));
+        request.write("unfinished request");
+      }));
+    HttpClientResponse response = paused.future().await();
+    serverConn
+      .future()
+      .await()
+      .close()
+      .await();
+    Throwable throwable = requestFailure.future().await();
+    assertTrue(throwable instanceof HttpClosedException);
+    Future<Buffer> responseBody = response.body();
+    response.resume();
+    Buffer body = responseBody.await();
+    assertEquals(expected, body);
+    assertTrue(responseEnded.get());
+  }
+
+  @Test
+  public void testTrailersRace(Checkpoint checkpoint) throws Exception {
+
+    server.requestHandler(req -> {
+      req.response()
+        .setChunked(true)
+        .putTrailer("my-trailer", "trailer-value")
+        .end(Buffer.buffer("hello"));
+    });
+
+    startServer();
+
+    int n = 8;
+    CountDownLatch latch = checkpoint.asLatch(n);
+
+    for (int i = 0; i < n;i++) {
+      ContextInternal ctx = ((VertxInternal) vertx).createEventLoopContext();
+      ctx.runOnContext(v -> {
+        client.request(requestOptions)
+          .onComplete(TestUtils.onSuccess(req -> {
+            req.send().onComplete(TestUtils.onSuccess(resp -> {
+              resp.endHandler(v2 -> {
+                assertNotNull(resp.getTrailer("my-trailer"));
+                latch.countDown();
+              });
+            }));
+          }));
+      });
+    }
+    checkpoint.awaitSuccess();
+  }
+
+  @Test
+  public void testSendAfterRequestEndedWithFailure() throws Exception {
+    server.requestHandler(req -> req.response().end());
+    startServer(testAddress);
+    HttpClientRequest request = client
+      .request(requestOptions)
+      .await();
+    request
+      .end()
+      .await();
+    List<Future<HttpClientResponse>> variants = Arrays.asList(
+      request.send(),
+      request.send("body"),
+      request.send(Buffer.buffer("body")));
+    for (Future<HttpClientResponse> variant : variants) {
+      try {
+        variant.await(20, java.util.concurrent.TimeUnit.SECONDS);
+        fail();
+      } catch (IllegalStateException expected) {
+      }
+    }
+  }
+
+  @Test
+  public void testServerMessageWrite() throws Exception {
+    AtomicReference<Future<Void>> ref1 = new AtomicReference<>();
+    AtomicReference<Future<Void>> ref2 = new AtomicReference<>();
+    server.requestHandler(request -> {
+      HttpServerResponse response = request
+        .response()
+        .setChunked(true);
+      ref1.set(response.write("chunk"));
+      ref2.set(response.end("last"));
+    });
+    startServer();
+    client.request(new RequestOptions(requestOptions).setPort(server.actualPort()))
+      .compose(req -> req
+        .send()
+        .expecting(HttpResponseExpectation.SC_OK)
+        .compose(HttpClientResponse::body));
+    TestUtils.assertWaitUntil(() -> ref1.get() != null);
+    TestUtils.assertWaitUntil(() -> ref2.get() != null);
+    assertTrue(ref1.get() instanceof WriteResult);
+    assertTrue(ref2.get() instanceof WriteResult);
+  }
+
+  @Test
+  public void testWriteResult() throws Exception {
+    Buffer chunk = Buffer.buffer(TestUtils.randomAlphaString(256));
+    server.requestHandler(request -> {
+      HttpServerResponse response = request.response();
+      while (true) {
+        WriteResult writeResult = (WriteResult) response.write(chunk);
+        if (!writeResult.isWritable()) {
+          writeResult.drainHandler(v -> {
+            response.end();
+          });
+          break;
+        }
+      }
+    });
+    startServer();
+    client.request(new RequestOptions(requestOptions).setPort(server.actualPort()))
+      .compose(req -> req
+        .send()
+        .expecting(HttpResponseExpectation.SC_OK)
+        .compose(HttpClientResponse::body))
+      .await();
+  }
+}

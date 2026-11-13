@@ -1,4 +1,5 @@
-[![Build Status](https://github.com/eclipse-vertx/vert.x/workflows/CI/badge.svg?branch=master)](https://github.com/eclipse-vertx/vert.x/actions?query=workflow%3ACI)
+[![Build Status (5.x)](https://github.com/eclipse-vertx/vert.x/actions/workflows/ci-5.x.yml/badge.svg)](https://github.com/eclipse-vertx/vert.x/actions/workflows/ci-5.x.yml)
+[![Build Status (4.x)](https://github.com/eclipse-vertx/vert.x/actions/workflows/ci-4.x.yml/badge.svg)](https://github.com/eclipse-vertx/vert.x/actions/workflows/ci-4.x.yml)
 
 ## Vert.x Core
 
@@ -6,7 +7,7 @@ This is the repository for Vert.x core.
 
 Vert.x core contains fairly low-level functionality, including support for HTTP, TCP, file system access, and various other features. You can use this directly in your own applications, and it's used by many of the other components of Vert.x.
 
-For more information on Vert.x and where Vert.x core fits into the big picture please see the [website](http://vertx.io).
+For more information on Vert.x and where Vert.x core fits into the big picture please see the [website](https://vertx.io).
 
 ## Building Vert.x artifacts
 
@@ -22,20 +23,27 @@ Runs the tests
 > mvn test
 ```
 
+Tests can be run with specified HTTP port and/or HTTPS port.
+
+```
+> mvn test -Dvertx.httpPort=8888 -Dvertx.httpsPort=4044
+```
+
 Vert.x supports native transport on BSD and Linux, to run the tests with native transport
 
 ```
-> mvn test -PtestNativeTransport
+> mvn test -PNativeEpoll
+> mvn test -PNativeIoUring
+> mvn test -PNativeKQueue
 ```
 
 Vert.x supports domain sockets on Linux exclusively, to run the tests with domain sockets
 
 ```
-> mvn test -PtestDomainSockets
+> mvn test -PNativeEpoll+DomainSockets
 ```
 
-Vert.x has a few integrations tests that run a differently configured JVM (classpath, system properties, etc....)
-for ALPN, native and logging
+Vert.x has integrations tests that run a differently configured JVM (classpath, system properties, etc....)
 
 ```
 > vertx verify -Dtest=FooTest # FooTest does not exists, its only purpose is to execute no tests during the test phase

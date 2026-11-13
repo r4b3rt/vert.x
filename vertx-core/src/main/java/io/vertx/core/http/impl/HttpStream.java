@@ -1,0 +1,96 @@
+/*
+ * Copyright (c) 2011-2025 Contributors to the Eclipse Foundation
+ *
+ * This program and the accompanying materials are made available under the
+ * terms of the Eclipse Public License 2.0 which is available at
+ * http://www.eclipse.org/legal/epl-2.0, or the Apache License, Version 2.0
+ * which is available at https://www.apache.org/licenses/LICENSE-2.0.
+ *
+ * SPDX-License-Identifier: EPL-2.0 OR Apache-2.0
+ */
+package io.vertx.core.http.impl;
+
+import io.netty.buffer.ByteBufAllocator;
+import io.vertx.core.Future;
+import io.vertx.core.Handler;
+import io.vertx.core.MultiMap;
+import io.vertx.core.buffer.Buffer;
+import io.vertx.core.internal.buffer.BufferInternal;
+import io.vertx.core.http.*;
+import io.vertx.core.internal.ContextInternal;
+import io.vertx.core.internal.streams.WriteResult;
+import io.vertx.core.internal.http.ContentDecoder;
+import io.vertx.core.internal.http.ContentEncoder;
+
+/**
+ * @author <a href="mailto:julien@julienviet.com">Julien Viet</a>
+ */
+public interface HttpStream {
+
+  /**
+   * @return the stream id, {@code 1} denotes the first stream, HTTP/1 is a simple sequence, HTTP/2
+   * is the actual stream identifier.
+   */
+  long id();
+
+  /**
+   * @return the stream version or null if it's not yet determined
+   */
+  HttpVersion version();
+
+  Object metric();
+
+  HttpConnection connection();
+  ContextInternal context();
+  ByteBufAllocator allocator();
+
+  /**
+   * @return the encoder of the outbound content of this stream
+   */
+  ContentEncoder contentEncoder();
+
+  WriteResult end(MultiMap trailers);
+
+  default WriteResult write(Buffer buf) {
+    return contentEncoder().write(((BufferInternal)buf).getByteBuf());
+  }
+
+  default WriteResult end(Buffer buf) {
+    return contentEncoder().end(((BufferInternal)buf).getByteBuf());
+  }
+
+  default WriteResult end() {
+    return contentEncoder().end();
+  }
+
+  Future<Void> writeFrame(int type, int flags, Buffer payload);
+  Future<Void> writeReset(long code);
+
+  Future<Boolean> cancel();
+
+  /**
+   * Sets a decoder for the content of this stream. The decoder must be set early in the lifecycle of the stream, before
+   * any chunk is received. A previously set decoder is closed with a {@link HttpClosedException}.
+   *
+   * @param decoder the decoder
+   * @return the result of the decoder, failed when the decoder fails or is closed before the end of the content
+   * @throws IllegalStateException when the content has already started
+   */
+  <T> Future<T> contentDecoder(ContentDecoder<T> decoder);
+
+  HttpStream resetHandler(Handler<Long> handler);
+  HttpStream exceptionHandler(Handler<Throwable> handler);
+  HttpStream customFrameHandler(Handler<HttpFrame> handler);
+  HttpStream trailersHandler(Handler<MultiMap> handler);
+  HttpStream priorityChangeHandler(Handler<StreamPriority> handler);
+  HttpStream closeHandler(Handler<Void> handler);
+  HttpStream drainHandler(Handler<Void> handler);
+
+  boolean isWritable();
+
+  HttpStream setWriteQueueMaxSize(int maxSize);
+
+  StreamPriority priority();
+  HttpStream updatePriority(StreamPriority streamPriority);
+
+}

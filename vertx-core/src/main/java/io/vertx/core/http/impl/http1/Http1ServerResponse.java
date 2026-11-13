@@ -1,0 +1,769 @@
+/*
+ * Copyright (c) 2011-2019 Contributors to the Eclipse Foundation
+ *
+ * This program and the accompanying materials are made available under the
+ * terms of the Eclipse Public License 2.0 which is available at
+ * http://www.eclipse.org/legal/epl-2.0, or the Apache License, Version 2.0
+ * which is available at https://www.apache.org/licenses/LICENSE-2.0.
+ *
+ * SPDX-License-Identifier: EPL-2.0 OR Apache-2.0
+ */
+
+package io.vertx.core.http.impl.http1;
+
+import io.vertx.core.internal.streams.FailedWrite;
+import io.vertx.core.internal.http.ContentEncoder;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
+import io.netty.channel.ChannelFuture;
+import io.netty.channel.ChannelPipeline;
+import io.netty.handler.codec.http.*;
+import io.netty.handler.codec.http.HttpVersion;
+import io.netty.handler.codec.http.websocketx.extensions.WebSocketServerExtensionHandler;
+import io.vertx.codegen.annotations.Nullable;
+import io.vertx.core.Future;
+import io.vertx.core.Handler;
+import io.vertx.core.MultiMap;
+import io.vertx.core.Promise;
+import io.vertx.core.buffer.Buffer;
+import io.vertx.core.http.*;
+import io.vertx.core.internal.http.HttpServerResponseInternal;
+import io.vertx.core.internal.streams.WriteResult;
+import io.vertx.core.http.Cookie;
+import io.vertx.core.http.HttpHeaders;
+import io.vertx.core.http.HttpMethod;
+import io.vertx.core.http.impl.CookieJar;
+import io.vertx.core.http.impl.HttpUtils;
+import io.vertx.core.http.impl.ServerCookie;
+import io.vertx.core.internal.buffer.BufferInternal;
+import io.vertx.core.http.impl.headers.Http1xHeaders;
+import io.vertx.core.internal.ContextInternal;
+import io.vertx.core.internal.VertxInternal;
+import io.vertx.core.internal.PromiseInternal;
+import io.vertx.core.net.HostAndPort;
+import io.vertx.core.net.NetSocket;
+import io.vertx.core.spi.metrics.Metrics;
+import io.vertx.core.spi.observability.HttpResponse;
+
+import java.io.File;
+import java.io.IOException;
+import java.io.RandomAccessFile;
+import java.nio.channels.FileChannel;
+import java.util.Set;
+
+import static io.vertx.core.http.HttpHeaders.*;
+
+/**
+ * @author <a href="http://tfox.org">Tim Fox</a>
+ */
+public class Http1ServerResponse implements HttpServerResponseInternal, ContentEncoder, HttpResponse {
+
+  private static final Buffer EMPTY_BUFFER = BufferInternal.buffer(Unpooled.EMPTY_BUFFER);
+  private static final String RESPONSE_WRITTEN = "Response has already been written";
+
+  // Immutable
+  private final VertxInternal vertx;
+  private final HttpRequest request;
+  private final Http1ServerConnection conn;
+  private final ContextInternal context;
+  private final HttpVersion version;
+  private final boolean keepAlive;
+  private final boolean head;
+  private final Object requestMetric;
+  private final Http1xHeaders headers;
+
+  // Context thread
+  private HttpResponseStatus status;
+  private String statusMessage;
+  private CookieJar cookies;
+  private boolean headersSent;
+  private MultiMap trailers;
+  private io.netty.handler.codec.http.HttpHeaders trailingHeaders = EmptyHttpHeaders.INSTANCE;
+  private long bytesWritten;
+  boolean trailersSent;
+  boolean requestEnded;
+  private boolean closed;
+  private Future<NetSocket> netSocket;
+  private Handler<Void> headersEndHandler;
+  private Handler<Void> bodyEndHandler;
+  private Handler<Void> endHandler;
+  private Handler<Void> drainHandler;
+  private Handler<Throwable> exceptionHandler;
+  private Handler<Void> closeHandler;
+
+  Http1ServerResponse(VertxInternal vertx,
+                      ContextInternal context,
+                      Http1ServerConnection conn,
+                      HttpRequest request,
+                      Object requestMetric,
+                      boolean keepAlive) {
+    this.vertx = vertx;
+    this.conn = conn;
+    this.context = context;
+    this.version = request.protocolVersion();
+    this.headers = Http1xHeaders.httpHeaders();
+    this.request = request;
+    this.status = HttpResponseStatus.OK;
+    this.requestMetric = requestMetric;
+    this.keepAlive = keepAlive;
+    this.head = request.method() == io.netty.handler.codec.http.HttpMethod.HEAD;
+  }
+
+  @Override
+  public MultiMap headers() {
+    return headers;
+  }
+
+  @Override
+  public MultiMap trailers() {
+    if (trailers == null) {
+      Http1xHeaders v = Http1xHeaders.httpHeaders();
+      trailers = v;
+      trailingHeaders = v;
+    }
+    return trailers;
+  }
+
+  @Override
+  public int statusCode() {
+    return status.code();
+  }
+
+  @Override
+  public int getStatusCode() {
+    return status.code();
+  }
+
+  @Override
+  public HttpServerResponse setStatusCode(int statusCode) {
+    checkHeadWritten();
+    status = statusMessage != null ? new HttpResponseStatus(statusCode, statusMessage) : HttpResponseStatus.valueOf(statusCode);
+    return this;
+  }
+
+  @Override
+  public String getStatusMessage() {
+    return status.reasonPhrase();
+  }
+
+  @Override
+  public HttpServerResponse setStatusMessage(String statusMessage) {
+    checkHeadWritten();
+    this.statusMessage = statusMessage;
+    this.status = new HttpResponseStatus(status.code(), statusMessage);
+    return this;
+  }
+
+  @Override
+  public Http1ServerResponse setChunked(boolean chunked) {
+    checkHeadWritten();
+    // HTTP 1.0 does not support chunking so we ignore this if HTTP 1.0
+    if (version != HttpVersion.HTTP_1_0) {
+      headers.set(HttpHeaders.TRANSFER_ENCODING, chunked ? "chunked" : null);
+    }
+    return this;
+  }
+
+  @Override
+  public boolean isChunked() {
+    return headers.contains(HttpHeaders.TRANSFER_ENCODING, HttpHeaders.CHUNKED, true);
+  }
+
+  @Override
+  public Http1ServerResponse putHeader(String key, String value) {
+    checkHeadWritten();
+    headers.set(key, value);
+    return this;
+  }
+
+  @Override
+  public Http1ServerResponse putHeader(String key, Iterable<String> values) {
+    checkHeadWritten();
+    headers.set(key, values);
+    return this;
+  }
+
+  @Override
+  public Http1ServerResponse putTrailer(String key, String value) {
+    checkValid();
+    trailers().set(key, value);
+    return this;
+  }
+
+  @Override
+  public Http1ServerResponse putTrailer(String key, Iterable<String> values) {
+    checkValid();
+    trailers().set(key, values);
+    return this;
+  }
+
+  @Override
+  public HttpServerResponse putHeader(CharSequence name, CharSequence value) {
+    checkHeadWritten();
+    headers.set(name, value);
+    return this;
+  }
+
+  @Override
+  public HttpServerResponse putHeader(CharSequence name, Iterable<CharSequence> values) {
+    checkHeadWritten();
+    headers.set(name, values);
+    return this;
+  }
+
+  @Override
+  public HttpServerResponse putTrailer(CharSequence name, CharSequence value) {
+    checkValid();
+    trailers().set(name, value);
+    return this;
+  }
+
+  @Override
+  public HttpServerResponse putTrailer(CharSequence name, Iterable<CharSequence> value) {
+    checkValid();
+    trailers().set(name, value);
+    return this;
+  }
+
+  @Override
+  public HttpServerResponseInternal setWriteQueueMaxSize(int size) {
+    checkValid();
+    conn.doSetWriteQueueMaxSize(size);
+    return this;
+  }
+
+  @Override
+  public boolean writeQueueFull() {
+    checkValid();
+    return conn.writeQueueFull();
+  }
+
+  @Override
+  public HttpServerResponseInternal drainHandler(Handler<Void> handler) {
+    if (handler != null) {
+      checkValid();
+    }
+    drainHandler = handler;
+    return this;
+  }
+
+  @Override
+  public HttpServerResponseInternal exceptionHandler(Handler<Throwable> handler) {
+    if (handler != null) {
+      checkValid();
+    }
+    exceptionHandler = handler;
+    return this;
+  }
+
+  @Override
+  public HttpServerResponse closeHandler(Handler<Void> handler) {
+    if (handler != null) {
+      checkValid();
+    }
+    closeHandler = handler;
+    return this;
+  }
+
+  @Override
+  public HttpServerResponse endHandler(@Nullable Handler<Void> handler) {
+    if (handler != null) {
+      checkValid();
+    }
+    endHandler = handler;
+    return this;
+  }
+
+  @Override
+  public WriteResult writeHead() {
+    checkHeadWritten();
+    if (!headers.contains(HttpHeaders.TRANSFER_ENCODING) && !headers.contains(HttpHeaders.CONTENT_LENGTH)) {
+      headers.set(HttpHeaders.TRANSFER_ENCODING, HttpHeaders.CHUNKED);
+    }
+    prepareHeaders(-1);
+    headersSent = true;
+    VertxHttpObject msg = new VertxHttpResponse(head, version, status, headers);
+    return conn.write(msg);
+  }
+
+  @Override
+  public WriteResult write(Buffer chunk) {
+    checkValid();
+    return write(((BufferInternal)chunk).getByteBuf());
+  }
+
+  @Override
+  public Future<Void> write(String chunk, String enc) {
+    return write(BufferInternal.buffer(chunk, enc));
+  }
+
+  @Override
+  public Future<Void> write(String chunk) {
+    return write(BufferInternal.buffer(chunk));
+  }
+
+  @Override
+  public Future<Void> writeContinue() {
+    return conn.write100Continue();
+  }
+
+  @Override
+  public Future<Void> writeEarlyHints(MultiMap headers) {
+    Http1xHeaders headersMultiMap;
+    if (headers instanceof Http1xHeaders) {
+      headersMultiMap = (Http1xHeaders) headers;
+    } else {
+      headersMultiMap = Http1xHeaders.httpHeaders();
+      headersMultiMap.addAll(headers);
+    }
+    checkHeadWritten();
+    return conn.write103EarlyHints(headersMultiMap);
+  }
+
+  @Override
+  public Future<Void> end(String chunk) {
+    return end(Buffer.buffer(chunk));
+  }
+
+  @Override
+  public Future<Void> end(String chunk, String enc) {
+    return end(Buffer.buffer(chunk, enc));
+  }
+
+  @Override
+  public WriteResult end(Buffer chunk) {
+    checkValid();
+    return end(((BufferInternal)chunk).getByteBuf());
+  }
+
+  @Override
+  public ContentEncoder contentEncoder() {
+    return this;
+  }
+
+  @Override
+  public WriteResult end(ByteBuf data) {
+    if (trailersSent) {
+      data.release();
+      return new FailedWrite(context, RESPONSE_WRITTEN);
+    }
+    trailersSent = true;
+    bytesWritten += data.readableBytes();
+    VertxHttpObject msg;
+    if (!headersSent) {
+      // if the head was not written yet we can write out everything in one go
+      // which is cheaper.
+      prepareHeaders(bytesWritten);
+      headersSent = true;
+      msg = new VertxFullHttpResponse(head, version, status, data, headers, trailingHeaders);
+    } else {
+      msg = new VertxLastHttpContent(data, trailingHeaders);
+    }
+    WriteResult result = conn.write(msg);
+    Handler<Void> handler = bodyEndHandler;
+    if (handler != null) {
+      context.dispatch(handler);
+    }
+    handler = closed ? null : endHandler;
+    if (handler != null) {
+      context.dispatch(handler);
+    }
+    if (requestEnded) {
+      tryClose();
+    }
+    return result;
+  }
+
+  public void handleHandshakeCompleted() {
+    context.execute(this, Http1ServerResponse::onHandshakeCompleted);
+  }
+
+  private void onHandshakeCompleted() {
+    if (conn.httpMetrics != null) {
+      conn.httpMetrics.responseBegin(requestMetric, this);
+    }
+    setStatusCode(101);
+    boolean close = requestEnded;
+    headersSent = true;
+    trailersSent = true;
+    conn.responseComplete();
+    if (close) {
+      tryClose();
+    }
+  }
+
+  @Override
+  public WriteResult end() {
+    return end(EMPTY_BUFFER);
+  }
+
+  @Override
+  public Future<Void> sendFile(String filename, long offset, long length) {
+    File file = vertx.fileResolver().resolve(filename);
+    RandomAccessFile raf;
+    long size;
+    try {
+      raf = new RandomAccessFile(file, "r");
+      size = raf.length();
+    } catch (Exception e) {
+      return context.failedFuture(e);
+    }
+    if (!headers.contains(HttpHeaders.CONTENT_TYPE)) {
+      CharSequence mimeType = MimeMapping.mimeTypeForFilename(filename);
+      if (mimeType == null) {
+        mimeType = APPLICATION_OCTET_STREAM;
+      }
+      headers.set(CONTENT_TYPE, mimeType);
+    }
+    return sendFileInternal(offset, length, size, raf, null, true);
+  }
+
+  @Override
+  public Future<Void> sendFile(RandomAccessFile file, long offset, long length) {
+    if (!headers.contains(HttpHeaders.CONTENT_TYPE)) {
+      headers.set(CONTENT_TYPE, APPLICATION_OCTET_STREAM);
+    }
+    long size;
+    try {
+      size = file.length();
+    } catch (IOException e) {
+      return context.failedFuture(e);
+    }
+    return sendFileInternal(offset, length, size, file, null, false);
+  }
+
+  @Override
+  public Future<Void> sendFile(FileChannel channel, long offset, long length) {
+    if (!headers.contains(HttpHeaders.CONTENT_TYPE)) {
+      headers.set(CONTENT_TYPE, APPLICATION_OCTET_STREAM);
+    }
+    long size;
+    try {
+      size = channel.size();
+    } catch (IOException e) {
+      return context.failedFuture(e);
+    }
+    return sendFileInternal(offset, length, size, null, channel, false);
+  }
+
+  private Future<Void> sendFileInternal(long offset, long length, long size, RandomAccessFile file, FileChannel fileChannel, boolean close) {
+    Future<Void> ret = null;
+    try {
+      ContextInternal ctx = vertx.getOrCreateContext();
+      if (offset < 0) {
+        return ctx.failedFuture("offset : " + offset + " (expected: >= 0)");
+      }
+      if (length < 0) {
+        return ctx.failedFuture("length : " + length + " (expected: >= 0)");
+      }
+      long actualLength = Math.min(length, size - offset);
+      long actualOffset = Math.min(offset, size);
+      if (actualLength < 0) {
+        return ctx.failedFuture("offset : " + offset + " is larger than the requested file length : " + size);
+      }
+      checkValid();
+      checkHeadWritten();
+      // fail early before status code/headers are written to the response
+      prepareHeaders(actualLength);
+      headersSent = true;
+      bytesWritten = actualLength;
+      trailersSent = true;
+      conn.write(new VertxAssembledHttpResponse(head, version, status, headers));
+      FileChannel toSend = fileChannel == null ? file.getChannel() : fileChannel;
+      ChannelFuture channelFuture = conn.sendFile(toSend, actualOffset, actualLength);
+      PromiseInternal<Void> promise = context.promise();
+      ret = promise.future();
+      channelFuture.addListener(future -> {
+        if (future.isSuccess()) {
+          context.execute(promise, this::onSendFileCompleted);
+        } else {
+          promise.fail(future.cause());
+        }
+
+        //
+        if (close) {
+          try {
+            if (file != null) {
+              file.close();
+            } else {
+              fileChannel.close();
+            }
+          } catch (IOException ignore) {
+          }
+        }
+      });
+      return ret;
+    } finally {
+      if (ret == null && close) {
+        try {
+          if (file != null) {
+            file.close();
+          } else {
+            fileChannel.close();
+          }
+        } catch (IOException ignore) {
+        }
+      }
+    }
+  }
+
+  private void onSendFileCompleted(PromiseInternal<Void> promise) {
+    Handler<Void> bodyEndHandler;
+    Handler<Void> endHandler;
+    bodyEndHandler = this.bodyEndHandler;
+    endHandler = this.endHandler;
+    if (bodyEndHandler != null) {
+      context.dispatch(bodyEndHandler);
+    }
+    if (endHandler != null) {
+      context.dispatch(endHandler);
+    }
+    // write an empty last content to let the http encoder know the response is complete
+    conn.write(new VertxLastHttpContent(Unpooled.buffer(0), DefaultHttpHeadersFactory.trailersFactory().newHeaders())).onComplete(promise);
+    boolean close = requestEnded;
+    if (close) {
+      tryClose();
+    }
+  }
+
+  @Override
+  public boolean ended() {
+    return trailersSent;
+  }
+
+  @Override
+  public boolean closed() {
+    return closed;
+  }
+
+  @Override
+  public boolean headWritten() {
+    return headersSent;
+  }
+
+  @Override
+  public long bytesWritten() {
+    return bytesWritten;
+  }
+
+  @Override
+  public HttpServerResponse headersEndHandler(Handler<Void> handler) {
+    headersEndHandler = handler;
+    return this;
+  }
+
+  @Override
+  public HttpServerResponse bodyEndHandler(Handler<Void> handler) {
+    bodyEndHandler = handler;
+    return this;
+  }
+
+  void handleWriteQueueDrained(Void v) {
+    Handler<Void> handler = drainHandler;
+    if (handler != null) {
+      context.dispatch(null, handler);
+    }
+  }
+
+  void onException(Throwable t) {
+    Handler<Throwable> handler = exceptionHandler;
+    if (handler != null) {
+      context.dispatch(t, handler);
+    }
+  }
+
+  void tryClose() {
+    Handler<Void> handler;
+    if (closed) {
+      return;
+    }
+    closed = true;
+    handler = closeHandler;
+    if (handler != null) {
+      context.dispatch(null, handler);
+    }
+  }
+
+  private void checkValid() {
+    if (trailersSent) {
+      throw new IllegalStateException(RESPONSE_WRITTEN);
+    }
+  }
+
+  private void checkHeadWritten() {
+    if (headersSent) {
+      throw new IllegalStateException("Response head already sent");
+    }
+  }
+
+  private void prepareHeaders(long contentLength) {
+    if (version == HttpVersion.HTTP_1_0 && keepAlive) {
+      headers.set(HttpHeaders.CONNECTION, HttpHeaders.KEEP_ALIVE);
+    } else if (version == HttpVersion.HTTP_1_1 && !keepAlive) {
+      headers.set(HttpHeaders.CONNECTION, HttpHeaders.CLOSE);
+    }
+    if (head || status == HttpResponseStatus.NOT_MODIFIED) {
+      // For HEAD request or NOT_MODIFIED response
+      // don't set automatically the content-length
+      // and remove the transfer-encoding
+      headers.remove(HttpHeaders.TRANSFER_ENCODING);
+    } else {
+      // Set content-length header automatically
+      if (contentLength >= 0 && !headers.contains(HttpHeaders.CONTENT_LENGTH) && !headers.contains(HttpHeaders.TRANSFER_ENCODING)) {
+        headers.set(HttpHeaders.CONTENT_LENGTH, HttpUtils.positiveLongToString(contentLength));
+      }
+    }
+    Handler<Void> handler = headersEndHandler;
+    if (handler != null) {
+      context.dispatch(handler);
+    }
+    if (cookies != null) {
+      setCookies();
+    }
+    if (Metrics.METRICS_ENABLED) {
+      // TODO : DONE SOMEWHERE ELSE FROM EVENT LOOP
+      reportResponseBegin();
+    }
+  }
+
+  private void setCookies() {
+    for (ServerCookie cookie: cookies) {
+      if (cookie.isChanged()) {
+        headers.add(SET_COOKIE, cookie.encode());
+      }
+    }
+  }
+
+  private void reportResponseBegin() {
+    if (conn.httpMetrics != null) {
+      conn.httpMetrics.responseBegin(requestMetric, this);
+    }
+  }
+
+  @Override
+  public WriteResult write(ByteBuf chunk) {
+    if (trailersSent) {
+      chunk.release();
+      return new FailedWrite(context, RESPONSE_WRITTEN);
+    }
+    if (!headersSent && !headers.contains(HttpHeaders.TRANSFER_ENCODING) && !headers.contains(HttpHeaders.CONTENT_LENGTH)) {
+      if (version != HttpVersion.HTTP_1_0) {
+        headers.set(HttpHeaders.TRANSFER_ENCODING, HttpHeaders.CHUNKED);
+      }
+    }
+    bytesWritten += chunk.readableBytes();
+    VertxHttpObject msg;
+    if (!headersSent) {
+      prepareHeaders(-1);
+      msg = new VertxAssembledHttpResponse(head, version, status, headers, chunk);
+      headersSent = true;
+    } else {
+      msg = new VertxHttpContent(chunk);
+    }
+    return conn.write(msg);
+  }
+
+  Future<NetSocket> netSocket(HttpMethod requestMethod, MultiMap requestHeaders) {
+    if (netSocket != null) {
+      return netSocket;
+    }
+    if (headersSent) {
+      return context.failedFuture("Response already sent");
+    }
+    if (!HttpUtils.isConnectOrUpgrade(requestMethod, requestHeaders)) {
+      return context.failedFuture("HTTP method must be CONNECT or an HTTP upgrade to upgrade the connection to a TCP socket");
+    }
+    ChannelPipeline pipeline = conn.channel().pipeline();
+    WebSocketServerExtensionHandler wsHandler = pipeline.get(WebSocketServerExtensionHandler.class);
+    if (wsHandler != null) {
+      pipeline.remove(wsHandler);
+    }
+    HttpResponseStatus st = requestMethod == HttpMethod.CONNECT ? HttpResponseStatus.OK : HttpResponseStatus.SWITCHING_PROTOCOLS;
+    prepareHeaders(-1);
+    Promise<NetSocket> socketPromise = context.promise();
+    boolean close = requestEnded;
+    status = st;
+    headersSent = true;
+    trailersSent = true;
+    netSocket = socketPromise.future();
+    conn.write(new VertxAssembledHttpResponse(head, version, st, headers));
+    conn.netSocket(socketPromise);
+    if (close) {
+      tryClose();
+    }
+    return netSocket;
+  }
+
+  @Override
+  public long streamId() {
+    return -1L;
+  }
+
+  @Override
+  public Future<Void> reset(long code) {
+    if (trailersSent) {
+      return context.failedFuture("Response written");
+    }
+    conn.close();
+    return context.succeededFuture();
+  }
+
+  @Override
+  public Future<Boolean> cancel() {
+    return reset().map(true);
+  }
+
+  @Override
+  public Future<HttpServerResponse> push(HttpMethod method, HostAndPort authority, String path, MultiMap headers) {
+    return context.failedFuture("HTTP/1 does not support response push");
+  }
+
+  @Override
+  public Future<Void> writeCustomFrame(int type, int flags, Buffer payload) {
+    return context.failedFuture("HTTP/1 does not support custom frames");
+  }
+
+  CookieJar cookies() {
+    // avoid double parsing
+    if (cookies == null) {
+      String cookieHeader = request.headers().get(io.vertx.core.http.HttpHeaders.COOKIE);
+      if (cookieHeader == null) {
+        cookies = new CookieJar();
+      } else {
+        cookies = new CookieJar(cookieHeader);
+      }
+    }
+    return cookies;
+  }
+
+  @Override
+  public HttpServerResponse addCookie(Cookie cookie) {
+    checkHeadWritten();
+    cookies().add((ServerCookie) cookie);
+    return this;
+  }
+
+  @Override
+  public @Nullable Cookie removeCookie(String name, boolean invalidate) {
+    checkHeadWritten();
+    return cookies().removeOrInvalidate(name, invalidate);
+  }
+
+  @Override
+  public @Nullable Cookie removeCookie(String name, String domain, String path, boolean invalidate) {
+    checkHeadWritten();
+    return cookies().removeOrInvalidate(name, domain, path, invalidate);
+  }
+
+  @Override
+  public @Nullable Set<Cookie> removeCookies(String name, boolean invalidate) {
+    checkHeadWritten();
+    return (Set) cookies().removeOrInvalidateAll(name, invalidate);
+  }
+
+  @Override
+  public Future<Void> writeAltSvc(String advertisement) {
+    putHeader(io.vertx.core.http.HttpHeaders.ALT_SVC, advertisement);
+    return context.succeededFuture();
+  }
+}

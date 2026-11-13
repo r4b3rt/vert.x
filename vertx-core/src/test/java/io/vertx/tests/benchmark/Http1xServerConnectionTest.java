@@ -1,0 +1,90 @@
+/*
+ * Copyright (c) 2011-2024 Contributors to the Eclipse Foundation
+ *
+ * This program and the accompanying materials are made available under the
+ * terms of the Eclipse Public License 2.0 which is available at
+ * http://www.eclipse.org/legal/epl-2.0, or the Apache License, Version 2.0
+ * which is available at https://www.apache.org/licenses/LICENSE-2.0.
+ *
+ * SPDX-License-Identifier: EPL-2.0 OR Apache-2.0
+ */
+package io.vertx.tests.benchmark;
+
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
+import io.netty.channel.embedded.EmbeddedChannel;
+import io.vertx.core.Handler;
+import io.vertx.core.ThreadingModel;
+import io.vertx.core.buffer.Buffer;
+import io.vertx.core.http.*;
+import io.vertx.core.http.impl.http1.Http1ServerConnection;
+import io.vertx.core.http.impl.http1.VertxHttpRequestDecoder;
+import io.vertx.core.http.impl.http1.VertxHttpResponseEncoder;
+import io.vertx.core.internal.ContextInternal;
+import io.vertx.core.internal.VertxInternal;
+import io.vertx.core.net.impl.VertxHandler;
+import io.vertx.core.tracing.TracingPolicy;
+import io.vertx.test.core.VertxTestBase;
+import org.junit.Test;
+
+public class Http1xServerConnectionTest extends VertxTestBase {
+
+  private static final String HELLO_WORLD = "Hello, world!";
+  private static final Buffer HELLO_WORLD_BUFFER = Buffer.buffer(HELLO_WORLD);
+
+  @Test
+  public void testSimple() {
+
+    Handler<HttpServerRequest> app = request -> {
+      HttpServerResponse response = request.response();
+      response.end(HELLO_WORLD_BUFFER);
+    };
+
+    VertxInternal vertx = (VertxInternal) this.vertx;
+
+    EmbeddedChannel vertxChannel = new EmbeddedChannel(
+      new VertxHttpRequestDecoder(new Http1ServerConfig()),
+      new VertxHttpResponseEncoder());
+    vertxChannel.config().setAllocator(new io.vertx.benchmarks.HttpServerHandlerBenchmark.Alloc());
+
+    ContextInternal context = vertx
+      .contextBuilder()
+      .withEventLoop(vertxChannel.eventLoop())
+      .withClassLoader(Thread.currentThread().getContextClassLoader())
+      .build();
+
+
+    VertxHandler<Http1ServerConnection> handler = VertxHandler.create(chctx -> {
+      Http1ServerConnection conn = new Http1ServerConnection(
+        ThreadingModel.EVENT_LOOP,
+        () -> context,
+        false,
+        null,
+        null,
+        HttpServerOptions.DEFAULT_MAX_FORM_ATTRIBUTE_SIZE,
+        HttpServerOptions.DEFAULT_MAX_FORM_FIELDS,
+        HttpServerOptions.DEFAULT_MAX_FORM_BUFFERED_SIZE,
+        new QueryParamDecoderConfig(),
+        new Http1ServerConfig(),
+        false,
+        null,
+        chctx,
+        context,
+        "localhost",
+        TracingPolicy.PROPAGATE,
+        null,
+        null);
+      conn.handler(app);
+      return conn;
+    });
+    vertxChannel.pipeline().addLast("handler", handler);
+
+    ByteBuf GET = Unpooled.unreleasableBuffer(Unpooled.copiedBuffer((
+      "GET / HTTP/1.1\r\n" +
+        "\r\n").getBytes()));
+    vertxChannel.writeInbound(GET);
+    vertxChannel.outboundMessages().poll();
+
+  }
+
+}

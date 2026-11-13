@@ -1,61 +1,58 @@
 name: CI
 on:
-  push:
-    branches:
-      - master
-      - '[0-9]+.[0-9]+'
-  pull_request:
-    branches:
-      - master
-      - '[0-9]+.[0-9]+'
-  schedule:
-    - cron:  '0 4 * * *'
+  workflow_call:
+    inputs:
+      branch:
+        required: true
+        type: 'string'
+      jdk:
+        default: 8
+        type: 'string'
+      os:
+        default: ubuntu-latest
+        type: 'string'
+      profile:
+        default: ''
+        type: 'string'
+      container:
+        default: ''
+        type: 'string'
 jobs:
   Test:
     name: Run tests
-    strategy:
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-        profile: [""]
-        jdk: [8]
-        include:
-          - os: ubuntu-latest
-            jdk: 17
-          - os: ubuntu-latest
-            jdk: 8
-            profile: '-PtestNativeTransport'
-          - os: ubuntu-latest
-            jdk: 8
-            profile: '-PtestDomainSockets'
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ inputs.os }}
+    timeout-minutes: 60
+    container: ${{ inputs.container || null }}
     steps:
+      - name: Install container dependencies
+        if: ${{ inputs.container != '' }}
+        run: |
+          apt-get update && apt-get install -y git maven openssl libssl-dev libapr1t64
       - name: Checkout
-        uses: actions/checkout@v2
-      - name: Install JDK
-        uses: actions/setup-java@v2
+        uses: actions/checkout@v6
         with:
-          java-version: ${{ matrix.jdk }}
+          ref: ${{ inputs.branch }}
+      - name: Install JDK
+        uses: actions/setup-java@v5
+        with:
+          java-version: ${{ inputs.jdk }}
           distribution: temurin
       - name: Run tests
-        run: mvn -s .github/maven-ci-settings.xml -q clean verify -B ${{ matrix.profile }}
-  Deploy:
-    name: Deploy to OSSRH
-    if: ${{ github.repository_owner == 'eclipse-vertx' && (github.event_name == 'push' || github.event_name == 'schedule') }}
-    needs: Test
-    runs-on: ubuntu-latest
-    env:
-      VERTX_NEXUS_USERNAME: ${{ secrets.VERTX_NEXUS_USERNAME }}
-      VERTX_NEXUS_PASSWORD: ${{ secrets.VERTX_NEXUS_PASSWORD }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v2
-      - name: Install JDK
-        uses: actions/setup-java@v2
-        with:
-          java-version: 8
-          distribution: temurin
-      - name: Get project version
-        run: echo "PROJECT_VERSION=$(mvn org.apache.maven.plugins:maven-help-plugin:evaluate -Dexpression=project.version -B | grep -v '\[')" >> $GITHUB_ENV
-      - name: Maven deploy
-        if: ${{ endsWith(env.PROJECT_VERSION, '-SNAPSHOT') }}
-        run: mvn deploy -s .github/maven-cd-settings.xml -DskipTests -B
+        if: ${{ runner.os != 'Linux' || inputs.container != ''  }}
+        run: mvn -s .github/maven-ci-settings.xml -q clean verify -B -Pcheckstyle "-Dsurefire.timeout=3000" ${{ inputs.profile }}
+      - name: Run tests
+        if: ${{ runner.os == 'Linux' && inputs.container == '' }}
+        run: |
+          # io_uring testing requires more locked memory for kernel ring buffers than the default 8MB limit
+          sudo prlimit --pid $$ --memlock=16777216:16777216
+          mvn -s .github/maven-ci-settings.xml -q clean verify -B -Pcheckstyle "-Dsurefire.timeout=3000" ${{ inputs.profile }}
+      - name: Print thread dumps of timed out tests
+        if: ${{ failure() }}
+        shell: bash
+        run: |
+          # surefire writes a thread dump of a fork it kills after -Dsurefire.timeout
+          find . -path '*/surefire-reports/*.dump' | while read -r f; do
+            echo "::group::$f"
+            cat "$f"
+            echo "::endgroup::"
+          done

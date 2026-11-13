@@ -1,0 +1,125 @@
+/*
+ * Copyright (c) 2011-2019 Contributors to the Eclipse Foundation
+ *
+ * This program and the accompanying materials are made available under the
+ * terms of the Eclipse Public License 2.0 which is available at
+ * http://www.eclipse.org/legal/epl-2.0, or the Apache License, Version 2.0
+ * which is available at https://www.apache.org/licenses/LICENSE-2.0.
+ *
+ * SPDX-License-Identifier: EPL-2.0 OR Apache-2.0
+ */
+package io.vertx.tests.http;
+
+import io.vertx.core.Vertx;
+import io.vertx.core.VertxOptions;
+import io.vertx.core.buffer.Buffer;
+import io.vertx.core.http.*;
+import io.vertx.core.internal.VertxInternal;
+import io.vertx.core.net.SocketAddress;
+import io.vertx.test.core.TestUtils;
+import io.vertx.test.http.HttpTestBase2;
+import org.junit.Test;
+
+import java.io.File;
+import java.util.ArrayList;
+import java.util.List;
+
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNull;
+import static org.junit.Assume.assumeFalse;
+import static org.junit.Assume.assumeTrue;
+
+public class HttpDomainSocketTest extends HttpTestBase2 {
+
+  @Test
+  public void testListenDomainSocketAddressNative() throws Exception {
+    Vertx vx = Vertx.vertx(new VertxOptions().setPreferNativeTransport(true));
+    try {
+      assumeTrue("Native transport must be enabled", vx.isNativeTransportEnabled());
+      testListenDomainSocketAddress(vx);
+    } finally {
+      vx.close().await();
+    }
+  }
+
+  @Test
+  public void testListenDomainSocketAddressJdk() throws Exception {
+    Vertx vx = Vertx.vertx(new VertxOptions().setPreferNativeTransport(false));
+    try {
+      assumeFalse("Native transport must not be enabled", vx.isNativeTransportEnabled());
+      testListenDomainSocketAddress(vx);
+    } finally {
+      vx.close().await();
+    }
+  }
+
+  private void testListenDomainSocketAddress(Vertx vx) throws Exception {
+    assumeTrue("Transport must support domain sockets", ((VertxInternal)vx).transport().supportsDomainSockets());
+    int len = 3;
+    List<SocketAddress> addresses = new ArrayList<>();
+    for (int i = 0;i < len;i++) {
+      File sockFile = TestUtils.tmpFile(".sock");
+      SocketAddress sockAddress = SocketAddress.domainSocketAddress(sockFile.getAbsolutePath());
+      HttpServer server = vx
+        .createHttpServer(createBaseServerOptions())
+        .requestHandler(req -> req.response().end(sockAddress.path()));
+      startServer(sockAddress, server);
+      addresses.add(sockAddress);
+    }
+    HttpClient client = vx.createHttpClient(createBaseClientOptions());
+    for (int i = 0;i < len;i++) {
+      SocketAddress sockAddress = addresses.get(i);
+      for (int j = 0;j < len;j++) {
+        Buffer body = client
+          .request(new RequestOptions(requestOptions).setServer(sockAddress))
+          .compose(req -> req
+            .send()
+            .expecting(HttpResponseExpectation.SC_OK)
+            .compose(HttpClientResponse::body))
+          .await();
+        assertEquals(sockAddress.path(), body.toString());
+      }
+    }
+  }
+
+  @Test
+  public void testMissingAuthority() throws Exception {
+    Vertx vx = Vertx.vertx(new VertxOptions().setPreferNativeTransport(true));
+    try {
+      assumeTrue("Native transport must be enabled", vx.isNativeTransportEnabled());
+      testNoAuthority(vx, HttpVersion.HTTP_1_1);
+      testNoAuthority(vx, HttpVersion.HTTP_2);
+    } finally {
+      vx.close().await();
+    }
+  }
+
+  private void testNoAuthority(Vertx vx, HttpVersion version) throws Exception {
+    File sockFile = TestUtils.tmpFile(".sock");
+    SocketAddress sockAddress = SocketAddress.domainSocketAddress(sockFile.getAbsolutePath());
+    HttpServerBuilder serverBuilder = vx.httpServerBuilder()
+      .with(new HttpServerConfig().setVersions(version));
+    HttpClientBuilder clientBuilder = vx.httpClientBuilder()
+      .with(new HttpClientConfig()
+        .setHttp2Config(new Http2ClientConfig().setClearTextUpgrade(false))
+        .setVersions(version));
+    HttpServer server = serverBuilder
+      .build();
+    server.requestHandler(request -> {
+      assertNull(request.authority());
+      request
+        .response()
+        .end();
+    });
+    server
+      .listen(sockAddress)
+      .await();
+    HttpClient client = clientBuilder.build();
+    client.request(new RequestOptions().setServer(sockAddress))
+      .compose(request -> request
+        .send()
+        .expecting(HttpResponseExpectation.SC_OK)
+        .compose(HttpClientResponse::end))
+      .await();
+  }
+}

@@ -1,0 +1,1145 @@
+/*
+ * Copyright (c) 2011-2019 Contributors to the Eclipse Foundation
+ *
+ * This program and the accompanying materials are made available under the
+ * terms of the Eclipse Public License 2.0 which is available at
+ * http://www.eclipse.org/legal/epl-2.0, or the Apache License, Version 2.0
+ * which is available at https://www.apache.org/licenses/LICENSE-2.0.
+ *
+ * SPDX-License-Identifier: EPL-2.0 OR Apache-2.0
+ */
+
+package io.vertx.core.http;
+
+import io.vertx.core.impl.Arguments;
+import io.netty.handler.logging.ByteBufFormat;
+import io.vertx.codegen.annotations.DataObject;
+import io.vertx.codegen.json.annotations.JsonGen;
+import io.vertx.core.buffer.Buffer;
+import io.vertx.core.http.impl.HttpUtils;
+import io.vertx.core.json.JsonObject;
+import io.vertx.core.net.*;
+import io.vertx.core.tracing.TracingPolicy;
+
+import java.time.Duration;
+import java.util.*;
+import java.util.concurrent.TimeUnit;
+
+import static io.vertx.core.http.HttpHeaders.*;
+
+/**
+ * Options describing how an {@link HttpClient} will make connections.
+ *
+ * @author <a href="http://tfox.org">Tim Fox</a>
+ */
+@DataObject
+@JsonGen(publicConverter = false)
+public class HttpClientOptions extends ClientOptionsBase {
+
+  /**
+   * The default maximum number of concurrent streams per connection for HTTP/2 = -1
+   */
+  public static final int DEFAULT_HTTP2_MULTIPLEXING_LIMIT = -1;
+
+  /**
+   * The default initial HTTP/2 stream window size = 1 MiB
+   */
+  public static final int DEFAULT_INITIAL_SETTINGS_INITIAL_WINDOW_SIZE = 1024 * 1024;
+
+  /**
+   * The default connection window size for HTTP/2 = 16 MiB
+   */
+  public static final int DEFAULT_HTTP2_CONNECTION_WINDOW_SIZE = 16 * 1024 * 1024;
+
+  /**
+   * The default keep alive timeout for HTTP/2 connection can send = 60 seconds
+   */
+  public static final int DEFAULT_HTTP2_KEEP_ALIVE_TIMEOUT = 60;
+
+  /**
+   * Default value of whether keep-alive is enabled = {@code true}
+   */
+  public static final boolean DEFAULT_KEEP_ALIVE = true;
+
+  /**
+   * Default value of whether pipe-lining is enabled = {@code false}
+   */
+  public static final boolean DEFAULT_PIPELINING = false;
+
+  /**
+   * The default maximum number of requests an HTTP/1.1 pipe-lined connection can send = 10
+   */
+  public static final int DEFAULT_PIPELINING_LIMIT = 10;
+
+  /**
+   * The default keep alive timeout for HTTP/1.1 connection can send = 60 seconds
+   */
+  public static final int DEFAULT_KEEP_ALIVE_TIMEOUT = 60;
+
+  /**
+   * Whether the client should send requests with an {@code accepting-encoding} header set to a compression algorithm by default = {@code false}
+   */
+  public static final boolean DEFAULT_DECOMPRESSION_SUPPORTED = false;
+
+  /**
+   * Default value of whether hostname verification (for SSL/TLS) is enabled = {@code true}
+   */
+  public static final boolean DEFAULT_VERIFY_HOST = true;
+
+  /**
+   * The default value for host name = "localhost"
+   */
+  public static final String DEFAULT_DEFAULT_HOST = "localhost";
+
+  /**
+   * The default value for port = 80
+   */
+  public static final int DEFAULT_DEFAULT_PORT = 80;
+
+  /**
+   * The default protocol version = HTTP/1.1
+   */
+  public static final HttpVersion DEFAULT_PROTOCOL_VERSION = HttpVersion.HTTP_1_1;
+
+  /**
+   * Default max HTTP chunk size = 8192
+   */
+  public static final int DEFAULT_MAX_CHUNK_SIZE = 8192;
+
+  /**
+   * Default max length of the initial line (e.g. {@code "HTTP/1.1 200 OK"}) = 4096
+   */
+  public static final int DEFAULT_MAX_INITIAL_LINE_LENGTH = 4096;
+
+  /**
+   * Default max length of all headers = 8192
+   */
+  public static final int DEFAULT_MAX_HEADER_SIZE = 8192;
+
+  /**
+   * Default Application-Layer Protocol Negotiation versions = [] (automatic according to protocol version)
+   */
+  public static final List<HttpVersion> DEFAULT_ALPN_VERSIONS = Collections.emptyList();
+
+  /**
+   * Default using HTTP/1.1 upgrade for establishing an <i>h2C</i> connection = {@code true}
+   */
+  public static final boolean DEFAULT_HTTP2_CLEAR_TEXT_UPGRADE = true;
+
+  /**
+   * Default to use a preflight OPTIONS request for <i>h2C</i> without prior knowledge connection = {@code false}
+   */
+  public static final boolean DEFAULT_HTTP2_CLEAR_TEXT_UPGRADE_WITH_PREFLIGHT_REQUEST = false;
+
+  /**
+   * Default maximum length of the aggregated content in bytes
+   */
+  public static final int DEFAULT_HTTP2_UPGRADE_MAX_CONTENT_LENGTH = 65536;
+
+  /*
+   * Default max redirect = 16
+   */
+  public static final int DEFAULT_MAX_REDIRECTS = 16;
+
+  /**
+   * Default max redirect buffer size = 4 * 1024 bytes (4KB)
+   */
+  public static final int DEFAULT_MAX_REDIRECT_BUFFERED_SIZE = 4 * 1024;
+
+  /*
+   * Default force SNI = {@code false}
+   */
+  public static final boolean DEFAULT_FORCE_SNI = false;
+
+  /**
+   * Default initial buffer size for HttpObjectDecoder = 128 bytes
+   */
+  public static final int DEFAULT_DECODER_INITIAL_BUFFER_SIZE = 128;
+
+  /**
+   * Default tracing control = {@link TracingPolicy#PROPAGATE}
+   */
+  public static final TracingPolicy DEFAULT_TRACING_POLICY = TracingPolicy.PROPAGATE;
+
+  /**
+   * Default shared client = {@code false}
+   */
+  public static final boolean DEFAULT_SHARED = false;
+
+  /**
+   * Actual name of anonymous shared client = {@code __vertx.DEFAULT}
+   */
+  public static final String DEFAULT_NAME = "__vertx.DEFAULT";
+
+  /**
+   * Use HTTP/2 multiplex implementation = {@code false}
+   */
+  public static final boolean DEFAULT_HTTP_2_MULTIPLEX_IMPLEMENTATION = false;
+
+  /**
+   * The default same-origin blocked header list = ({@code cookie}, {@code content-length}, {@code transfer-encoding})
+   */
+  public static final Set<String> DEFAULT_SAME_ORIGIN_REDIRECT_BLOCKED_HEADERS = Set.of(
+    COOKIE.toString(),
+    CONTENT_LENGTH.toString(),
+    TRANSFER_ENCODING.toString()
+  );
+
+  /**
+   * The default cross-origin blocked header list = ({@code authorization}, {@code cookie}, {@code proxy-authorization},
+   * {@code content-length}, {@code transfer-encoding})
+   */
+  public static final Set<String> DEFAULT_CROSS_ORIGIN_REDIRECT_BLOCKED_HEADERS = Set.of(
+    AUTHORIZATION.toString(),
+    COOKIE.toString(),
+    PROXY_AUTHORIZATION.toString(),
+    CONTENT_LENGTH.toString(),
+    TRANSFER_ENCODING.toString()
+  );
+
+  private Http1ClientConfig http1Config;
+  private Http2ClientConfig http2Config;
+  private boolean verifyHost;
+  private boolean decompressionSupported;
+  private boolean validateUri;
+  private String defaultHost;
+  private int defaultPort;
+  private HttpVersion protocolVersion;
+  private int maxRedirects;
+  private int maxRedirectBufferedSize;
+  private Set<String> sameOriginRedirectBlockedHeaders;
+  private Set<String> crossOriginRedirectBlockedHeaders;
+  private boolean forceSni;
+
+  private TracingPolicy tracingPolicy;
+
+  private boolean shared;
+  private String name;
+
+  /**
+   * Default constructor
+   */
+  public HttpClientOptions() {
+    super();
+    init();
+  }
+
+  /**
+   * Copy constructor
+   *
+   * @param other  the options to copy
+   */
+  public HttpClientOptions(ClientOptionsBase other) {
+    super(other);
+    init();
+  }
+
+  /**
+   * Copy constructor
+   *
+   * @param other  the options to copy
+   */
+  public HttpClientOptions(HttpClientOptions other) {
+    super(other);
+    this.http1Config = new Http1ClientConfig(other.http1Config);
+    this.http2Config = new Http2ClientConfig(other.http2Config);
+    this.verifyHost = other.isVerifyHost();
+    this.decompressionSupported = other.decompressionSupported;
+    this.validateUri = other.validateUri;
+    this.defaultHost = other.defaultHost;
+    this.defaultPort = other.defaultPort;
+    this.protocolVersion = other.protocolVersion;
+    this.maxRedirects = other.maxRedirects;
+    this.maxRedirectBufferedSize = other.maxRedirectBufferedSize;
+    this.sameOriginRedirectBlockedHeaders = other.sameOriginRedirectBlockedHeaders != null ? new HashSet<>(other.sameOriginRedirectBlockedHeaders) : null;
+    this.crossOriginRedirectBlockedHeaders = other.crossOriginRedirectBlockedHeaders != null ? new HashSet<>(other.crossOriginRedirectBlockedHeaders) : null;
+    this.forceSni = other.forceSni;
+    this.tracingPolicy = other.tracingPolicy;
+    this.shared = other.shared;
+    this.name = other.name;
+  }
+
+  /**
+   * Constructor to create an options from JSON
+   *
+   * @param json  the JSON
+   */
+  public HttpClientOptions(JsonObject json) {
+    super(json);
+    init();
+    HttpClientOptionsConverter.fromJson(json, this);
+  }
+
+  /**
+   * Convert to JSON
+   *
+   * @return the JSON
+   */
+  public JsonObject toJson() {
+    JsonObject json = super.toJson();
+    HttpClientOptionsConverter.toJson(this, json);
+    return json;
+  }
+
+  private void init() {
+    http1Config = new Http1ClientConfig();
+    http2Config = new Http2ClientConfig();
+    verifyHost = DEFAULT_VERIFY_HOST;
+    decompressionSupported = DEFAULT_DECOMPRESSION_SUPPORTED;
+    validateUri = HttpClientConfig.DEFAULT_VALIDATE_URI;
+    defaultHost = DEFAULT_DEFAULT_HOST;
+    defaultPort = DEFAULT_DEFAULT_PORT;
+    protocolVersion = DEFAULT_PROTOCOL_VERSION;
+    maxRedirects = DEFAULT_MAX_REDIRECTS;
+    maxRedirectBufferedSize = DEFAULT_MAX_REDIRECT_BUFFERED_SIZE;
+    forceSni = DEFAULT_FORCE_SNI;
+    tracingPolicy = DEFAULT_TRACING_POLICY;
+    shared = DEFAULT_SHARED;
+    name = DEFAULT_NAME;
+  }
+
+  public Http1ClientConfig getHttp1Config() {
+    return http1Config;
+  }
+
+  public Http2ClientConfig getHttp2Config() {
+    return http2Config;
+  }
+
+  @Override
+  protected ClientSSLOptions createSSLOptions() {
+    return super.createSSLOptions().setApplicationLayerProtocols(HttpUtils.fromHttpAlpnVersions(DEFAULT_ALPN_VERSIONS));
+  }
+
+  @Override
+  public HttpClientOptions setSendBufferSize(int sendBufferSize) {
+    super.setSendBufferSize(sendBufferSize);
+    return this;
+  }
+
+  @Override
+  public HttpClientOptions setReceiveBufferSize(int receiveBufferSize) {
+    super.setReceiveBufferSize(receiveBufferSize);
+    return this;
+  }
+
+  @Override
+  public HttpClientOptions setReuseAddress(boolean reuseAddress) {
+    super.setReuseAddress(reuseAddress);
+    return this;
+  }
+
+  @Override
+  public HttpClientOptions setReusePort(boolean reusePort) {
+    super.setReusePort(reusePort);
+    return this;
+  }
+
+  @Override
+  public HttpClientOptions setTrafficClass(int trafficClass) {
+    super.setTrafficClass(trafficClass);
+    return this;
+  }
+
+  @Override
+  public HttpClientOptions setTcpNoDelay(boolean tcpNoDelay) {
+    super.setTcpNoDelay(tcpNoDelay);
+    return this;
+  }
+
+  @Override
+  public HttpClientOptions setTcpKeepAlive(boolean tcpKeepAlive) {
+    super.setTcpKeepAlive(tcpKeepAlive);
+    return this;
+  }
+
+  @Override
+  public HttpClientOptions setSoLinger(int soLinger) {
+    super.setSoLinger(soLinger);
+    return this;
+  }
+
+  @Override
+  public HttpClientOptions setIdleTimeout(int idleTimeout) {
+    super.setIdleTimeout(idleTimeout);
+    return this;
+  }
+
+  @Override
+  public HttpClientOptions setReadIdleTimeout(int idleTimeout) {
+    super.setReadIdleTimeout(idleTimeout);
+    return this;
+  }
+
+  @Override
+  public HttpClientOptions setWriteIdleTimeout(int idleTimeout) {
+    super.setWriteIdleTimeout(idleTimeout);
+    return this;
+  }
+
+  @Override
+  public HttpClientOptions setIdleTimeoutUnit(TimeUnit idleTimeoutUnit) {
+    super.setIdleTimeoutUnit(idleTimeoutUnit);
+    return this;
+  }
+
+  @Override
+  public HttpClientOptions setSsl(boolean ssl) {
+    super.setSsl(ssl);
+    return this;
+  }
+
+  @Override
+  public HttpClientOptions setKeyCertOptions(KeyCertOptions options) {
+    super.setKeyCertOptions(options);
+    return this;
+  }
+
+  @Override
+  public HttpClientOptions setTrustOptions(TrustOptions options) {
+    super.setTrustOptions(options);
+    return this;
+  }
+
+  @Override
+  public HttpClientOptions addEnabledCipherSuite(String suite) {
+    super.addEnabledCipherSuite(suite);
+    return this;
+  }
+
+  @Override
+  public HttpClientOptions removeEnabledCipherSuite(String suite) {
+    super.removeEnabledCipherSuite(suite);
+    return this;
+  }
+
+  @Override
+  public HttpClientOptions addEnabledSecureTransportProtocol(final String protocol) {
+    super.addEnabledSecureTransportProtocol(protocol);
+    return this;
+  }
+
+  @Override
+  public HttpClientOptions removeEnabledSecureTransportProtocol(String protocol) {
+    return (HttpClientOptions) super.removeEnabledSecureTransportProtocol(protocol);
+  }
+
+  @Override
+  public HttpClientOptions setTcpFastOpen(boolean tcpFastOpen) {
+    return (HttpClientOptions) super.setTcpFastOpen(tcpFastOpen);
+  }
+
+  @Override
+  public HttpClientOptions setTcpCork(boolean tcpCork) {
+    return (HttpClientOptions) super.setTcpCork(tcpCork);
+  }
+
+  @Override
+  public HttpClientOptions setTcpQuickAck(boolean tcpQuickAck) {
+    return (HttpClientOptions) super.setTcpQuickAck(tcpQuickAck);
+  }
+
+  @Override
+  public HttpClientOptions setTcpUserTimeout(int tcpUserTimeout) {
+    return (HttpClientOptions) super.setTcpUserTimeout(tcpUserTimeout);
+  }
+
+  @Override
+  public HttpClientOptions addCrlPath(String crlPath) throws NullPointerException {
+    return (HttpClientOptions) super.addCrlPath(crlPath);
+  }
+
+  @Override
+  public HttpClientOptions addCrlValue(Buffer crlValue) throws NullPointerException {
+    return (HttpClientOptions) super.addCrlValue(crlValue);
+  }
+
+  @Override
+  public HttpClientOptions setConnectTimeout(int connectTimeout) {
+    super.setConnectTimeout(connectTimeout);
+    return this;
+  }
+
+  @Override
+  public HttpClientOptions setTrustAll(boolean trustAll) {
+    super.setTrustAll(trustAll);
+    return this;
+  }
+
+  @Override
+  public HttpClientOptions setEnabledSecureTransportProtocols(Set<String> enabledSecureTransportProtocols) {
+    super.setEnabledSecureTransportProtocols(enabledSecureTransportProtocols);
+    return this;
+  }
+
+  @Override
+  public HttpClientOptions setSslHandshakeTimeout(long sslHandshakeTimeout) {
+    super.setSslHandshakeTimeout(sslHandshakeTimeout);
+    return this;
+  }
+
+  @Override
+  public HttpClientOptions setSslHandshakeTimeoutUnit(TimeUnit sslHandshakeTimeoutUnit) {
+    super.setSslHandshakeTimeoutUnit(sslHandshakeTimeoutUnit);
+    return this;
+  }
+
+  /**
+   * @return the maximum number of concurrent streams for an HTTP/2 connection, {@code -1} means
+   * the value sent by the server
+   */
+  public int getHttp2MultiplexingLimit() {
+    return http2Config.getMultiplexingLimit();
+  }
+
+  /**
+   * Set a client limit of the number concurrent streams for each HTTP/2 connection, this limits the number
+   * of streams the client can create for a connection. The effective number of streams for a
+   * connection is the min of this value and the server's initial settings.
+   * <p/>
+   * Setting the value to {@code -1} means to use the value sent by the server's initial settings.
+   * {@code -1} is the default value.
+   *
+   * @param limit the maximum concurrent for an HTTP/2 connection
+   * @return a reference to this, so the API can be used fluently
+   */
+  public HttpClientOptions setHttp2MultiplexingLimit(int limit) {
+    http2Config.setMultiplexingLimit(limit);
+    return this;
+  }
+
+  /**
+   * @return the default HTTP/2 connection window size
+   */
+  public int getHttp2ConnectionWindowSize() {
+    return http2Config.getConnectionWindowSize();
+  }
+
+  /**
+   * Set the default HTTP/2 connection window size. This window is shared by all streams
+   * on the connection and is independent from the per-stream window configured by
+   * {@link Http2Settings#setInitialWindowSize(int)}.
+   * <p/>
+   * A value of {@code -1} leaves the connection window size chosen by the HTTP/2 implementation unchanged.
+   * The multiplex implementation can enlarge this window based on the initial stream window size.
+   *
+   * @param http2ConnectionWindowSize the window size applied to the connection
+   * @return a reference to this, so the API can be used fluently
+   */
+  public HttpClientOptions setHttp2ConnectionWindowSize(int http2ConnectionWindowSize) {
+    http2Config.setConnectionWindowSize(http2ConnectionWindowSize);
+    return this;
+  }
+
+  /**
+   * @return the keep alive timeout value in seconds for HTTP/2 connections
+   */
+  public int getHttp2KeepAliveTimeout() {
+    return http2Config.getKeepAliveTimeout() == null ? 0 : (int)http2Config.getKeepAliveTimeout().toSeconds();
+  }
+
+  /**
+   * Set the keep alive timeout for HTTP/2 connections, in seconds.
+   * <p/>
+   * This value determines how long a connection remains unused in the pool before being evicted and closed.
+   * <p/>
+   * A timeout of {@code 0} means there is no timeout.
+   *
+   * @param keepAliveTimeout the timeout, in seconds
+   * @return a reference to this, so the API can be used fluently
+   */
+  public HttpClientOptions setHttp2KeepAliveTimeout(int keepAliveTimeout) {
+    http2Config.setKeepAliveTimeout(keepAliveTimeout == 0 ? null : Duration.ofSeconds(keepAliveTimeout));
+    return this;
+  }
+
+  /**
+   * @return the HTTP/2 upgrade maximum length of the aggregated content in bytes
+   */
+  public int getHttp2UpgradeMaxContentLength() {
+    return http2Config.getUpgradeMaxContentLength();
+  }
+
+  /**
+   * Set the HTTP/2 upgrade maximum length of the aggregated content in bytes.
+   * This is only taken into account when {@link HttpClientOptions#isHttp2ClearTextUpgradeWithPreflightRequest)} is set to {@code false} (which is the default).
+   * When {@link HttpClientOptions#isHttp2ClearTextUpgradeWithPreflightRequest} is {@code true}, then the client makes a preflight OPTIONS request
+   * and the upgrade will not send a body, voiding the requirements.
+   *
+   * @param http2UpgradeMaxContentLength the length, in bytes
+   * @return a reference to this, so the API can be used fluently
+   */
+  public HttpClientOptions setHttp2UpgradeMaxContentLength(int http2UpgradeMaxContentLength) {
+    http2Config.setUpgradeMaxContentLength(http2UpgradeMaxContentLength);
+    return this;
+  }
+
+  /**
+   * @return whether to use the HTTP/2 implementation based on multiplexed channel
+   */
+  public boolean getHttp2MultiplexImplementation() {
+    return http2Config.getMultiplexImplementation();
+  }
+
+  /**
+   * Set which HTTP/2 implementation to use
+   *
+   * @param http2MultiplexImplementation whether to use the HTTP/2 multiplex implementation
+   * @return a reference to this, so the API can be used fluently
+   */
+  public HttpClientOptions setHttp2MultiplexImplementation(boolean http2MultiplexImplementation) {
+    http2Config.setMultiplexImplementation(http2MultiplexImplementation);
+    return this;
+  }
+
+  /**
+   * Is keep alive enabled on the client?
+   *
+   * @return {@code true} if enabled
+   */
+  public boolean isKeepAlive() {
+    return http1Config.isKeepAlive();
+  }
+
+  /**
+   * Set whether keep alive is enabled on the client
+   *
+   * @param keepAlive {@code true} if enabled
+   * @return a reference to this, so the API can be used fluently
+   */
+  public HttpClientOptions setKeepAlive(boolean keepAlive) {
+    http1Config.setKeepAlive(keepAlive);
+    return this;
+  }
+
+  /**
+   * @return the keep alive timeout value in seconds for HTTP/1.x connections
+   */
+  public int getKeepAliveTimeout() {
+    return http1Config.getKeepAliveTimeout() == null ? 0 : (int)http1Config.getKeepAliveTimeout().toSeconds();
+  }
+
+  /**
+   * Set the keep alive timeout for HTTP/1.x, in seconds.
+   * <p/>
+   * This value determines how long a connection remains unused in the pool before being evicted and closed.
+   * <p/>
+   * A timeout of {@code 0} means there is no timeout.
+   *
+   * @param keepAliveTimeout the timeout, in seconds
+   * @return a reference to this, so the API can be used fluently
+   */
+  public HttpClientOptions setKeepAliveTimeout(int keepAliveTimeout) {
+    http1Config.setKeepAliveTimeout(keepAliveTimeout == 0 ? null : Duration.ofSeconds(keepAliveTimeout));
+    return this;
+  }
+
+  /**
+   * Is pipe-lining enabled on the client
+   *
+   * @return {@code true} if pipe-lining is enabled
+   */
+  public boolean isPipelining() {
+    return http1Config.isPipelining();
+  }
+
+  /**
+   * Set whether pipe-lining is enabled on the client
+   *
+   * @param pipelining {@code true} if enabled
+   * @return a reference to this, so the API can be used fluently
+   */
+  public HttpClientOptions setPipelining(boolean pipelining) {
+    http1Config.setPipelining(pipelining);
+    return this;
+  }
+
+  /**
+   * @return the limit of pending requests a pipe-lined HTTP/1 connection can send
+   */
+  public int getPipeliningLimit() {
+    return http1Config.getPipeliningLimit();
+  }
+
+  /**
+   * Set the limit of pending requests a pipe-lined HTTP/1 connection can send.
+   *
+   * @param limit the limit of pending requests
+   * @return a reference to this, so the API can be used fluently
+   */
+  public HttpClientOptions setPipeliningLimit(int limit) {
+    http1Config.setPipeliningLimit(limit);
+    return this;
+  }
+
+  /**
+   * Is hostname verification (for SSL/TLS) enabled?
+   *
+   * @return {@code true} if enabled
+   */
+  public boolean isVerifyHost() {
+    return verifyHost;
+  }
+
+  /**
+   * Set whether hostname verification is enabled
+   *
+   * @param verifyHost {@code true} if enabled
+   * @return a reference to this, so the API can be used fluently
+   */
+  public HttpClientOptions setVerifyHost(boolean verifyHost) {
+    this.verifyHost = verifyHost;
+    return this;
+  }
+
+  /**
+   * Is request URI validation enabled?
+   *
+   * @return {@code true} if enabled
+   */
+  public boolean isValidateUri() {
+    return validateUri;
+  }
+
+  /**
+   * Set whether the client validates request URIs, rejecting URIs that cannot be safely encoded in an HTTP message.
+   *
+   * @param validateUri {@code true} if enabled
+   * @return a reference to this, so the API can be used fluently
+   */
+  public HttpClientOptions setValidateUri(boolean validateUri) {
+    this.validateUri = validateUri;
+    return this;
+  }
+
+  /**
+   * @return {@code true} if the client should send requests with an {@code accepting-encoding} header set to a compression algorithm, {@code false} otherwise
+   */
+  public boolean isDecompressionSupported() {
+    return decompressionSupported;
+  }
+
+  /**
+   * Whether the client should send requests with an {@code accepting-encoding} header set to a compression algorithm.
+   *
+   * @param decompressionSupported {@code true} if the client should send a request with an {@code accepting-encoding} header set to a compression algorithm, {@code false} otherwise
+   * @return a reference to this, so the API can be used fluently
+   */
+  public HttpClientOptions setDecompressionSupported(boolean decompressionSupported) {
+    this.decompressionSupported = decompressionSupported;
+    return this;
+  }
+
+  /**
+   * Get the default host name to be used by this client in requests if none is provided when making the request.
+   *
+   * @return  the default host name
+   */
+  public String getDefaultHost() {
+    return defaultHost;
+  }
+
+  /**
+   * Set the default host name to be used by this client in requests if none is provided when making the request.
+   *
+   * @return a reference to this, so the API can be used fluently
+   */
+  public HttpClientOptions setDefaultHost(String defaultHost) {
+    this.defaultHost = defaultHost;
+    return this;
+  }
+
+  /**
+   * Get the default port to be used by this client in requests if none is provided when making the request.
+   *
+   * @return  the default port
+   */
+  public int getDefaultPort() {
+    return defaultPort;
+  }
+
+  /**
+   * Set the default port to be used by this client in requests if none is provided when making the request.
+   *
+   * @return a reference to this, so the API can be used fluently
+   */
+  public HttpClientOptions setDefaultPort(int defaultPort) {
+    this.defaultPort = defaultPort;
+    return this;
+  }
+
+  /**
+   * Get the protocol version.
+   *
+   * @return the protocol version
+   */
+  public HttpVersion getProtocolVersion() {
+    return protocolVersion;
+  }
+
+  /**
+   * Set the protocol version.
+   *
+   * @param protocolVersion the protocol version
+   * @return a reference to this, so the API can be used fluently
+   */
+  public HttpClientOptions setProtocolVersion(HttpVersion protocolVersion) {
+    if (protocolVersion == null) {
+      throw new IllegalArgumentException("protocolVersion must not be null");
+    }
+    this.protocolVersion = protocolVersion;
+    return this;
+  }
+
+  /**
+   * Set the maximum HTTP chunk size
+   * @param maxChunkSize the maximum chunk size
+   * @return a reference to this, so the API can be used fluently
+   */
+  public HttpClientOptions setMaxChunkSize(int maxChunkSize) {
+    http1Config.setMaxChunkSize(maxChunkSize);
+    return this;
+  }
+
+  /**
+   * Returns the maximum HTTP chunk size
+   * @return the maximum HTTP chunk size
+   */
+  public int getMaxChunkSize() {
+    return http1Config.getMaxChunkSize();
+  }
+
+  /**
+   * @return the maximum length of the initial line for HTTP/1.x (e.g. {@code "GET / HTTP/1.0"})
+   */
+  public int getMaxInitialLineLength() {
+    return http1Config.getMaxInitialLineLength();
+  }
+
+  /**
+   * Set the maximum length of the initial line for HTTP/1.x (e.g. {@code "HTTP/1.1 200 OK"})
+   *
+   * @param maxInitialLineLength the new maximum initial length
+   * @return a reference to this, so the API can be used fluently
+   */
+  public HttpClientOptions setMaxInitialLineLength(int maxInitialLineLength) {
+    http1Config.setMaxInitialLineLength(maxInitialLineLength);
+    return this;
+  }
+
+  /**
+   * @return Returns the maximum length of all headers for HTTP/1.x
+   */
+  public int getMaxHeaderSize() {
+    return http1Config.getMaxHeaderSize();
+  }
+
+  /**
+   * Set the maximum length of all headers for HTTP/1.x .
+   *
+   * @param maxHeaderSize the new maximum length
+   * @return a reference to this, so the API can be used fluently
+   */
+  public HttpClientOptions setMaxHeaderSize(int maxHeaderSize) {
+    http1Config.setMaxHeaderSize(maxHeaderSize);
+    return this;
+  }
+
+  /**
+   * @return the initial HTTP/2 connection settings
+   */
+  public Http2Settings getInitialSettings() {
+    return http2Config.getInitialSettings();
+  }
+
+  /**
+   * Set the HTTP/2 connection settings immediately sent by to the server when the client connects.
+   *
+   * @param settings the settings value
+   * @return a reference to this, so the API can be used fluently
+   */
+  public HttpClientOptions setInitialSettings(Http2Settings settings) {
+    http2Config.setInitialSettings(settings);
+    return this;
+  }
+
+  @Override
+  public HttpClientOptions setUseAlpn(boolean useAlpn) {
+    return (HttpClientOptions) super.setUseAlpn(useAlpn);
+  }
+
+  @Override
+  public HttpClientOptions setSslEngineOptions(SSLEngineOptions sslEngineOptions) {
+    return (HttpClientOptions) super.setSslEngineOptions(sslEngineOptions);
+  }
+
+  /**
+   * @return the list of protocol versions to provide during the Application-Layer Protocol Negotiation. When
+   * the list is empty, the client provides a best effort list according to {@link #setProtocolVersion}
+   */
+  public List<HttpVersion> getAlpnVersions() {
+    List<String> applicationLayerProtocols = getOrCreateSSLOptions().getApplicationLayerProtocols();
+    return applicationLayerProtocols != null ? HttpUtils.toHttpAlpnVersions(applicationLayerProtocols ) : null;
+  }
+
+  /**
+   * Set the list of protocol versions to provide to the server during the Application-Layer Protocol Negotiation.
+   * When the list is empty, the client makes a best effort list according to {@link #setProtocolVersion}:
+   *
+   * <ul>
+   *   <li>{@link HttpVersion#HTTP_2}: [ "h2", "http/1.1" ]</li>
+   *   <li>otherwise: [{@link #getProtocolVersion()}]</li>
+   * </ul>
+   *
+   * @param alpnVersions the versions
+   * @return a reference to this, so the API can be used fluently
+   */
+  public HttpClientOptions setAlpnVersions(List<HttpVersion> alpnVersions) {
+    ClientSSLOptions sslOptions = getOrCreateSSLOptions();
+    if (alpnVersions != null) {
+      sslOptions.setApplicationLayerProtocols(HttpUtils.fromHttpAlpnVersions(alpnVersions));
+    } else {
+      sslOptions.setApplicationLayerProtocols(null);
+    }
+    return this;
+  }
+
+  /**
+   * @return {@code true} when an <i>h2c</i> connection is established using an HTTP/1.1 upgrade request, {@code false} when directly
+   */
+  public boolean isHttp2ClearTextUpgrade() {
+    return http2Config.isClearTextUpgrade();
+  }
+
+  /**
+   * Set to {@code true} when an <i>h2c</i> connection is established using an HTTP/1.1 upgrade request, and {@code false}
+   * when an <i>h2c</i> connection is established directly (with prior knowledge).
+   *
+   * @param value the upgrade value
+   * @return a reference to this, so the API can be used fluently
+   */
+  public HttpClientOptions setHttp2ClearTextUpgrade(boolean value) {
+    http2Config.setClearTextUpgrade(value);
+    return this;
+  }
+
+  /**
+   * @return {@code true} when an <i>h2c</i> connection established using an HTTP/1.1 upgrade request should perform
+   *         a preflight {@code OPTIONS} request to the origin server to establish the <i>h2c</i> connection
+   */
+  public boolean isHttp2ClearTextUpgradeWithPreflightRequest() {
+    return http2Config.isClearTextUpgradeWithPreflightRequest();
+  }
+
+  /**
+   * Set to {@code true} when an <i>h2c</i> connection established using an HTTP/1.1 upgrade request should perform
+   * a preflight {@code OPTIONS} request to the origin server to establish the <i>h2c</i> connection.
+   *
+   * @param value the upgrade value
+   * @return a reference to this, so the API can be used fluently
+   */
+  public HttpClientOptions setHttp2ClearTextUpgradeWithPreflightRequest(boolean value) {
+    http2Config.setClearTextUpgradeWithPreflightRequest(value);
+    return this;
+  }
+
+  /**
+   * @return the maximum number of redirection a request can follow
+   */
+  public int getMaxRedirects() {
+    return maxRedirects;
+  }
+
+  /**
+   * Set to {@code maxRedirects} the maximum number of redirection a request can follow.
+   *
+   * @param maxRedirects the maximum number of redirection
+   * @return a reference to this, so the API can be used fluently
+   */
+  public HttpClientOptions setMaxRedirects(int maxRedirects) {
+    this.maxRedirects = maxRedirects;
+    return this;
+  }
+
+  /**
+   * @return the maximum size in bytes of the redirect buffer when redirecting QUERY requests
+   */
+  public int getMaxRedirectBufferedSize() {
+    return maxRedirectBufferedSize;
+  }
+
+  /**
+   * Set the maximum size of the redirect buffer in bytes when redirecting QUERY requests.
+   *
+   * @param maxRedirectBufferedSize the maximum buffer size
+   * @return a reference to this, so the API can be used fluently
+   */
+  public HttpClientOptions setMaxRedirectBufferedSize(int maxRedirectBufferedSize) {
+    Arguments.require(maxRedirectBufferedSize >= 0, "Max redirect buffer size must be >= 0");
+    this.maxRedirectBufferedSize = maxRedirectBufferedSize;
+    return this;
+  }
+
+  /**
+   * @return the set of blocked HTTP headers on a same-origin redirection, the default being {@link HttpClientOptions#DEFAULT_SAME_ORIGIN_REDIRECT_BLOCKED_HEADERS}
+   */
+  public Set<String> getSameOriginRedirectBlockedHeaders() {
+    return sameOriginRedirectBlockedHeaders;
+  }
+
+  /**
+   * Update the set of blocked HTTP headers on a same-origin redirection.
+   *
+   * @param sameOriginRedirectBlockedHeaders the new set of headers to block
+   * @return a reference to this, so the API can be used fluently
+   */
+  public HttpClientOptions setSameOriginRedirectBlockedHeaders(Set<String> sameOriginRedirectBlockedHeaders) {
+    this.sameOriginRedirectBlockedHeaders = Objects.requireNonNull(sameOriginRedirectBlockedHeaders);
+    return this;
+  }
+
+  /**
+   * @return the set of blocked HTTP headers on a cross-origin redirection, the default being {@link HttpClientOptions#DEFAULT_CROSS_ORIGIN_REDIRECT_BLOCKED_HEADERS}
+   */
+  public Set<String> getCrossOriginRedirectBlockedHeaders() {
+    return crossOriginRedirectBlockedHeaders;
+  }
+
+  /**
+   * Update the set of blocked HTTP headers on a cross-origin redirection.
+   *
+   * @param crossOriginRedirectBlockedHeaders the new set of headers to block
+   * @return a reference to this, so the API can be used fluently
+   */
+  public HttpClientOptions setCrossOriginRedirectBlockedHeaders(Set<String> crossOriginRedirectBlockedHeaders) {
+    this.crossOriginRedirectBlockedHeaders = Objects.requireNonNull(crossOriginRedirectBlockedHeaders);
+    return this;
+  }
+
+  /**
+   * @return whether the client should always use SNI on TLS/SSL connections
+   */
+  public boolean isForceSni() {
+    return forceSni;
+  }
+
+  /**
+   * By default, the server name is only sent for Fully Qualified Domain Name (FQDN), setting
+   * this property to {@code true} forces the server name to be always sent.
+   *
+   * @param forceSni {@code true} when the client should always use SNI on TLS/SSL connections
+   * @return a reference to this, so the API can be used fluently
+   */
+  public HttpClientOptions setForceSni(boolean forceSni) {
+    this.forceSni = forceSni;
+    return this;
+  }
+
+  public HttpClientOptions setMetricsName(String metricsName) {
+    return (HttpClientOptions) super.setMetricsName(metricsName);
+  }
+
+  public HttpClientOptions setProxyOptions(ProxyOptions proxyOptions) {
+    return (HttpClientOptions) super.setProxyOptions(proxyOptions);
+  }
+
+  @Override
+  public HttpClientOptions setNonProxyHosts(List<String> nonProxyHosts) {
+    return (HttpClientOptions) super.setNonProxyHosts(nonProxyHosts);
+  }
+
+  @Override
+  public HttpClientOptions addNonProxyHost(String nonProxyHost) {
+    return (HttpClientOptions) super.addNonProxyHost(nonProxyHost);
+  }
+
+  @Override
+  public HttpClientOptions setLocalAddress(String localAddress) {
+    return (HttpClientOptions) super.setLocalAddress(localAddress);
+  }
+
+  @Override
+  public HttpClientOptions setLogActivity(boolean logEnabled) {
+    return (HttpClientOptions) super.setLogActivity(logEnabled);
+  }
+
+  @Override
+  public HttpClientOptions setActivityLogDataFormat(ByteBufFormat activityLogDataFormat) {
+    return (HttpClientOptions) super.setActivityLogDataFormat(activityLogDataFormat);
+  }
+
+  /**
+   * @return the initial buffer size for the HTTP decoder
+   */
+  public int getDecoderInitialBufferSize() {
+    return http1Config.getDecoderInitialBufferSize();
+  }
+
+  /**
+   * set to {@code initialBufferSizeHttpDecoder} the initial buffer of the HttpDecoder.
+   *
+   * @param decoderInitialBufferSize the initial buffer size
+   * @return a reference to this, so the API can be used fluently
+   */
+  public HttpClientOptions setDecoderInitialBufferSize(int decoderInitialBufferSize) {
+    http1Config.setDecoderInitialBufferSize(decoderInitialBufferSize);
+    return this;
+  }
+
+  /**
+   * @return the tracing policy
+   */
+  public TracingPolicy getTracingPolicy() {
+    return tracingPolicy;
+  }
+
+  /**
+   * Set the tracing policy for the client behavior when Vert.x has tracing enabled.
+   *
+   * @param tracingPolicy the tracing policy
+   * @return a reference to this, so the API can be used fluently
+   */
+  public HttpClientOptions setTracingPolicy(TracingPolicy tracingPolicy) {
+    this.tracingPolicy = tracingPolicy;
+    return this;
+  }
+
+  /**
+   * @return whether the pool is shared
+   */
+  public boolean isShared() {
+    return shared;
+  }
+
+  /**
+   * Set to {@code true} to share the client.
+   *
+   * <p> There can be multiple shared clients distinguished by {@link #getName()}, when no specific
+   * name is set, the {@link #DEFAULT_NAME} is used.
+   *
+   * @param shared {@code true} to use a shared client
+   * @return a reference to this, so the API can be used fluently
+   */
+  public HttpClientOptions setShared(boolean shared) {
+    this.shared = shared;
+    return this;
+  }
+
+  /**
+   * @return the client name used for sharing
+   */
+  public String getName() {
+    return name;
+  }
+
+  /**
+   * Set the client name, used when the client is shared, otherwise ignored.
+   * @param name the new name
+   * @return a reference to this, so the API can be used fluently
+   */
+  public HttpClientOptions setName(String name) {
+    Objects.requireNonNull(name, "Client name cannot be null");
+    this.name = name;
+    return this;
+  }
+}

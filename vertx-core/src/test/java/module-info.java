@@ -1,0 +1,69 @@
+import io.vertx.core.spi.VerticleFactory;
+import io.vertx.tests.deployment.ClasspathVerticleFactory;
+
+open module io.vertx.core.tests {
+
+  requires static io.vertx.codegen.api;
+  requires io.vertx.core;
+  requires io.vertx.core.logging;
+
+  requires static org.assertj.core;
+
+  requires junit;
+  requires java.management;
+  requires java.logging;
+  requires jdk.net;
+
+  requires static org.slf4j;
+  requires static org.apache.logging.log4j.core;
+
+  requires static jmh.core;
+
+  requires static com.fasterxml.jackson.core;
+  requires static com.fasterxml.jackson.annotation;
+  requires static com.fasterxml.jackson.databind;
+
+  requires io.netty.common;
+  requires io.netty.buffer;
+  requires io.netty.transport;
+  requires io.netty.handler;
+  requires io.netty.codec;
+  requires io.netty.codec.compression;
+  requires io.netty.codec.http;
+  requires static io.netty.codec.haproxy;
+  requires io.netty.codec.http2;
+  requires static io.netty.codec.classes.quic;
+  requires static io.netty.codec.quic;
+  requires io.netty.resolver.dns;
+  requires io.netty.handler.proxy;
+  requires io.netty.codec.http3;
+  requires io.netty.codec.dns;
+  requires static io.netty.tcnative.classes.openssl;
+  requires jdk.management;
+  requires static com.aayushatharva.brotli4j;
+
+  provides VerticleFactory with ClasspathVerticleFactory, io.vertx.tests.vertx.AccessEventBusFromInitVerticleFactory;
+
+  // Cluster manager implementations overrides them (TCK)
+  exports io.vertx.tests.ha;
+  exports io.vertx.tests.eventbus;
+  exports io.vertx.tests.shareddata;
+
+  // Jackson v3 codec testing
+  exports io.vertx.tests.json;
+  exports io.vertx.tests.json.jackson;
+
+  exports io.vertx.test.core;
+  exports io.vertx.test.fakecluster;
+  exports io.vertx.test.fakedns;
+  exports io.vertx.test.fakeloadbalancer;
+  exports io.vertx.test.fakemetrics;
+  exports io.vertx.test.fakeresolver;
+  exports io.vertx.test.fakestream;
+  exports io.vertx.test.faketracer;
+  exports io.vertx.test.http;
+  exports io.vertx.test.netty;
+  exports io.vertx.test.proxy;
+  exports io.vertx.test.tls;
+
+}
